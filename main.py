@@ -110,7 +110,7 @@ bot = commands.Bot(command_prefix="/", intents=intents)
 
 async def load_cogs():
     import os
-    skip = {"bear_event_types", "gift_captchasolver", "gift_operationsapi", "login_handler"}
+    skip = {"bear_event_types", "browser_headers", "gift_captchasolver", "gift_operationsapi", "login_handler", "permission_handler", "pimp_my_bot_editor", "pimp_my_bot_preview"}
     cogs_dir = os.path.join(os.path.dirname(__file__), "cogs")
     cogs = [
         f[:-3] for f in os.listdir(cogs_dir)
