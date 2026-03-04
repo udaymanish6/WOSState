@@ -1,9 +1,11 @@
 import discord
 from discord import app_commands
 from discord.ext import commands
-import sqlite3  
+import sqlite3
 import asyncio
 from datetime import datetime
+from .permission_handler import PermissionManager
+from .pimp_my_bot import theme
 
 class Alliance(commands.Cog):
     def __init__(self, bot, conn):
@@ -43,22 +45,21 @@ class Alliance(commands.Cog):
     async def view_alliances(self, interaction: discord.Interaction):
         
         if interaction.guild is None:
-            await interaction.response.send_message("❌ This command must be used in a server, not in DMs.", ephemeral=True)
+            await interaction.response.send_message(f"{theme.deniedIcon} This command must be used in a server, not in DMs.", ephemeral=True)
             return
 
         user_id = interaction.user.id
-        self.c_settings.execute("SELECT id, is_initial FROM admin WHERE id = ?", (user_id,))
-        admin = self.c_settings.fetchone()
+        guild_id = interaction.guild.id
 
-        if admin is None:
+        # Use centralized permission check
+        is_admin, is_global = PermissionManager.is_admin(user_id)
+        if not is_admin:
             await interaction.response.send_message("You do not have permission to view alliances.", ephemeral=True)
             return
 
-        is_initial = admin[1]
-        guild_id = interaction.guild.id
-
         try:
-            if is_initial == 1:
+            if is_global:
+                # Global admin - show all alliances
                 query = """
                     SELECT a.alliance_id, a.name, COALESCE(s.interval, 0) as interval
                     FROM alliance_list a
@@ -67,14 +68,27 @@ class Alliance(commands.Cog):
                 """
                 self.c.execute(query)
             else:
-                query = """
+                # Get alliance IDs using centralized permission manager
+                alliance_ids, _ = PermissionManager.get_admin_alliance_ids(user_id, guild_id)
+
+                if not alliance_ids:
+                    embed = discord.Embed(
+                        title="Existing Alliances",
+                        description="No alliances found for your permissions.",
+                        color=theme.emColor1
+                    )
+                    await interaction.response.send_message(embed=embed, ephemeral=True)
+                    return
+
+                placeholders = ','.join('?' * len(alliance_ids))
+                query = f"""
                     SELECT a.alliance_id, a.name, COALESCE(s.interval, 0) as interval
                     FROM alliance_list a
                     LEFT JOIN alliancesettings s ON a.alliance_id = s.alliance_id
-                    WHERE a.discord_server_id = ?
+                    WHERE a.alliance_id IN ({placeholders})
                     ORDER BY a.alliance_id ASC
                 """
-                self.c.execute(query, (guild_id,))
+                self.c.execute(query, alliance_ids)
 
             alliances = self.c.fetchall()
 
@@ -85,15 +99,15 @@ class Alliance(commands.Cog):
                 member_count = self.c_users.fetchone()[0]
                 
                 interval_text = f"{interval} minutes" if interval > 0 else "No automatic control"
-                alliance_list += f"🛡️ **{alliance_id}: {name}**\n👥 Members: {member_count}\n⏱️ Control Interval: {interval_text}\n\n"
+                alliance_list += f"{theme.allianceIcon} **{alliance_id}: {name}**\n{theme.userIcon} Members: {member_count}\n{theme.timeIcon} Control Interval: {interval_text}\n\n"
 
             if not alliance_list:
                 alliance_list = "No alliances found."
 
             embed = discord.Embed(
-                title="🛡️  Alliance List",
+                title="Existing Alliances",
                 description=alliance_list,
-                color=0x5865F2
+                color=theme.emColor1
             )
             await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -110,7 +124,7 @@ class Alliance(commands.Cog):
                 perm_check = interaction.guild.get_member(interaction.client.user.id)
                 if not perm_check.guild_permissions.administrator:
                     await interaction.response.send_message(
-                        "Beeb boop 🤖 I need **Administrator** permissions to function. "
+                        f"Beeb boop {theme.robotIcon} I need **Administrator** permissions to function. "
                         "Go to server settings --> Roles --> find my role --> scroll down and turn on Administrator", 
                         ephemeral=True
                     )
@@ -129,13 +143,13 @@ class Alliance(commands.Cog):
                 self.conn_settings.commit()
 
                 first_use_embed = discord.Embed(
-                    title="🎉  First Time Setup",
+                    title=f"{theme.newIcon} First Time Setup",
                     description=(
-                        f"Welcome, **{interaction.user.name}**!\n\n"
-                        "No administrators were found, so you've been automatically set as **Global Administrator**.\n"
-                        "You now have full access to all bot functions."
+                        "This command has been used for the first time and no administrators were found.\n\n"
+                        f"**{interaction.user.name}** has been added as the Global Administrator.\n\n"
+                        "You can now access all administrative functions."
                     ),
-                    color=0x57F287
+                    color=theme.emColor3
                 )
                 await interaction.response.send_message(embed=first_use_embed, ephemeral=True)
                 
@@ -152,68 +166,74 @@ class Alliance(commands.Cog):
                 return
 
             embed = discord.Embed(
-                title="❄️  Whiteout Survival — Control Panel",
+                title=f"❄️ Whiteout Survival — Control Panel",
                 description=(
-                    "🏰  **Alliance Operations** — manage alliances\n"
-                    "👥  **Member Operations** — add, remove, view members\n"
-                    "🤖  **Bot Operations** — admins & configuration\n"
-                    "🎁  **Gift Codes** — redeem & manage codes\n"
-                    "📜  **History** — furnace & nickname logs\n"
-                    "🔧  **Other Features** — extra tools"
+                    f"{theme.allianceIcon} **Alliance Operations** — manage alliances\n"
+                    f"{theme.membersIcon} **Member Operations** — add, remove, view members\n"
+                    f"{theme.robotIcon} **Bot Operations** — admins & configuration\n"
+                    f"{theme.giftIcon} **Gift Codes** — redeem & manage codes\n"
+                    f"{theme.listIcon} **History** — furnace & nickname logs\n"
+                    f"{theme.settingsIcon} **Other Features** — extra tools"
                 ),
-                color=0x5865F2
+                color=theme.emColor1
             )
             embed.set_footer(text="❄️ Whiteout Survival Bot")
 
             view = discord.ui.View()
             view.add_item(discord.ui.Button(
                 label="Alliance Operations",
-                emoji="🏰",
+                emoji=theme.allianceIcon,
                 style=discord.ButtonStyle.primary,
                 custom_id="alliance_operations",
                 row=0
             ))
             view.add_item(discord.ui.Button(
                 label="Member Operations",
-                emoji="👥",
+                emoji=theme.membersIcon,
                 style=discord.ButtonStyle.primary,
                 custom_id="member_operations",
                 row=0
             ))
             view.add_item(discord.ui.Button(
                 label="Bot Operations",
-                emoji="🤖",
+                emoji=theme.robotIcon,
                 style=discord.ButtonStyle.primary,
                 custom_id="bot_operations",
                 row=1
             ))
             view.add_item(discord.ui.Button(
-                label="Gift Operations",
-                emoji="🎁",
+                label="Gift Codes",
+                emoji=theme.giftIcon,
                 style=discord.ButtonStyle.primary,
                 custom_id="gift_code_operations",
                 row=1
             ))
             view.add_item(discord.ui.Button(
-                label="Alliance History",
-                emoji="📜",
+                label="History",
+                emoji=theme.listIcon,
                 style=discord.ButtonStyle.primary,
                 custom_id="alliance_history",
                 row=2
             ))
             view.add_item(discord.ui.Button(
                 label="Other Features",
-                emoji="🔧",
-                style=discord.ButtonStyle.secondary,
+                emoji=theme.settingsIcon,
+                style=discord.ButtonStyle.primary,
                 custom_id="other_features",
                 row=2
+            ))
+            view.add_item(discord.ui.Button(
+                label="Theme Settings",
+                emoji=f"{theme.paletteIcon}",
+                style=discord.ButtonStyle.primary,
+                custom_id="theme_settings",
+                row=3
             ))
 
             if admin_count == 0:
                 await interaction.edit_original_response(embed=embed, view=view)
             else:
                 await interaction.response.send_message(embed=embed, view=view)
-
 
         except Exception as e:
             if not any(error_code in str(e) for error_code in ["10062", "40060"]):
@@ -228,68 +248,75 @@ class Alliance(commands.Cog):
         """Display the main settings menu - can be called by other cogs"""
         try:
             embed = discord.Embed(
-                title="❄️  Whiteout Survival — Control Panel",
+                title=f"❄️ Whiteout Survival — Control Panel",
                 description=(
-                    "🏰  **Alliance Operations** — manage alliances\n"
-                    "👥  **Member Operations** — add, remove, view members\n"
-                    "🤖  **Bot Operations** — admins & configuration\n"
-                    "🎁  **Gift Codes** — redeem & manage codes\n"
-                    "📜  **History** — furnace & nickname logs\n"
-                    "🔧  **Other Features** — extra tools"
+                    f"{theme.allianceIcon} **Alliance Operations** — manage alliances\n"
+                    f"{theme.membersIcon} **Member Operations** — add, remove, view members\n"
+                    f"{theme.robotIcon} **Bot Operations** — admins & configuration\n"
+                    f"{theme.giftIcon} **Gift Codes** — redeem & manage codes\n"
+                    f"{theme.listIcon} **History** — furnace & nickname logs\n"
+                    f"{theme.settingsIcon} **Other Features** — extra tools"
                 ),
-                color=0x5865F2
+                color=theme.emColor1
             )
             embed.set_footer(text="❄️ Whiteout Survival Bot")
 
             view = discord.ui.View()
             view.add_item(discord.ui.Button(
                 label="Alliance Operations",
-                emoji="🏰",
+                emoji=theme.allianceIcon,
                 style=discord.ButtonStyle.primary,
                 custom_id="alliance_operations",
                 row=0
             ))
             view.add_item(discord.ui.Button(
                 label="Member Operations",
-                emoji="👥",
+                emoji=theme.membersIcon,
                 style=discord.ButtonStyle.primary,
                 custom_id="member_operations",
                 row=0
             ))
             view.add_item(discord.ui.Button(
                 label="Bot Operations",
-                emoji="🤖",
+                emoji=theme.robotIcon,
                 style=discord.ButtonStyle.primary,
                 custom_id="bot_operations",
                 row=1
             ))
             view.add_item(discord.ui.Button(
-                label="Gift Operations",
-                emoji="🎁",
+                label="Gift Codes",
+                emoji=theme.giftIcon,
                 style=discord.ButtonStyle.primary,
                 custom_id="gift_code_operations",
                 row=1
             ))
             view.add_item(discord.ui.Button(
-                label="Alliance History",
-                emoji="📜",
+                label="History",
+                emoji=theme.listIcon,
                 style=discord.ButtonStyle.primary,
                 custom_id="alliance_history",
                 row=2
             ))
             view.add_item(discord.ui.Button(
                 label="Other Features",
-                emoji="🔧",
-                style=discord.ButtonStyle.secondary,
+                emoji=theme.settingsIcon,
+                style=discord.ButtonStyle.primary,
                 custom_id="other_features",
                 row=2
+            ))
+            view.add_item(discord.ui.Button(
+                label="Theme Settings",
+                emoji=f"{theme.paletteIcon}",
+                style=discord.ButtonStyle.primary,
+                custom_id="theme_settings",
+                row=3
             ))
 
             try:
                 await interaction.response.edit_message(embed=embed, view=view)
             except discord.InteractionResponded:
                 pass
-                
+
         except Exception as _:
             pass
 
@@ -308,56 +335,60 @@ class Alliance(commands.Cog):
             try:
                 if custom_id == "alliance_operations":
                     embed = discord.Embed(
-                        title="🏰  Alliance Operations",
+                        title=f"{theme.allianceIcon} Alliance Operations",
                         description=(
-                            "➕  **Add** — create a new alliance\n"
-                            "✏️  **Edit** — rename or change interval\n"
-                            "🗑️  **Delete** — remove an alliance\n"
-                            "👀  **View** — list all alliances\n"
-                            "🔍  **Check** — run a manual control\n\n"
-                            "━━━━━━━━━━━━━━━━━━━━━━\n"
-                            "❄️ **Whiteout Survival** alliance management"
+                            f"Please select an operation:\n\n"
+                            f"**Available Operations**\n"
+                            f"{theme.upperDivider}\n"
+                            f"{theme.addIcon} **Add Alliance**\n"
+                            f"└ Create a new alliance\n\n"
+                            f"{theme.editListIcon} **Edit Alliance**\n"
+                            f"└ Modify existing alliance settings\n\n"
+                            f"{theme.trashIcon} **Delete Alliance**\n"
+                            f"└ Remove an existing alliance\n\n"
+                            f"{theme.eyesIcon} **View Alliances**\n"
+                            f"└ List all available alliances\n"
+                            f"{theme.lowerDivider}"
                         ),
-                        color=0x5865F2
+                        color=theme.emColor1
                     )
                     
+                    # All admins (global and server) can manage alliances
+                    # Server admins are scoped to their server's alliances in the handlers
                     view = discord.ui.View()
                     view.add_item(discord.ui.Button(
-                        label="Add Alliance", 
-                        emoji="➕",
-                        style=discord.ButtonStyle.success, 
-                        custom_id="add_alliance", 
-                        disabled=admin[1] != 1
+                        label="Add Alliance",
+                        emoji=theme.addIcon,
+                        style=discord.ButtonStyle.success,
+                        custom_id="add_alliance"
                     ))
                     view.add_item(discord.ui.Button(
-                        label="Edit Alliance", 
-                        emoji="✏️",
-                        style=discord.ButtonStyle.primary, 
-                        custom_id="edit_alliance", 
-                        disabled=admin[1] != 1
+                        label="Edit Alliance",
+                        emoji=theme.editListIcon,
+                        style=discord.ButtonStyle.primary,
+                        custom_id="edit_alliance"
                     ))
                     view.add_item(discord.ui.Button(
-                        label="Delete Alliance", 
-                        emoji="🗑️",
-                        style=discord.ButtonStyle.danger, 
-                        custom_id="delete_alliance", 
-                        disabled=admin[1] != 1
+                        label="Delete Alliance",
+                        emoji=theme.trashIcon,
+                        style=discord.ButtonStyle.danger,
+                        custom_id="delete_alliance"
                     ))
                     view.add_item(discord.ui.Button(
-                        label="View Alliances", 
-                        emoji="👀",
-                        style=discord.ButtonStyle.primary, 
+                        label="View Alliances",
+                        emoji=theme.eyesIcon,
+                        style=discord.ButtonStyle.primary,
                         custom_id="view_alliances"
                     ))
                     view.add_item(discord.ui.Button(
                         label="Check Alliance", 
-                        emoji="🔍",
+                        emoji=theme.searchIcon,
                         style=discord.ButtonStyle.primary, 
                         custom_id="check_alliance"
                     ))
                     view.add_item(discord.ui.Button(
                         label="Main Menu", 
-                        emoji="🏠",
+                        emoji=theme.homeIcon,
                         style=discord.ButtonStyle.secondary, 
                         custom_id="main_menu"
                     ))
@@ -365,9 +396,6 @@ class Alliance(commands.Cog):
                     await interaction.response.edit_message(embed=embed, view=view)
 
                 elif custom_id == "edit_alliance":
-                    if admin[1] != 1:
-                        await interaction.response.send_message("You do not have permission to perform this action.", ephemeral=True)
-                        return
                     await self.edit_alliance(interaction)
 
                 elif custom_id == "check_alliance":
@@ -388,7 +416,7 @@ class Alliance(commands.Cog):
                             label="Check All Alliances",
                             value="all",
                             description="Start control process for all alliances",
-                            emoji="🔄"
+                            emoji=theme.retryIcon
                         )
                     ]
                     
@@ -424,12 +452,17 @@ class Alliance(commands.Cog):
                                 initial_queue_pos = queue_info['queue_size'] + 1
                                 
                                 progress_embed = discord.Embed(
-                                    title="⏳  Queued — All Alliances",
-                                    color=0xFEE75C
+                                    title=f"{theme.hourglassIcon} Alliance Control Operation",
+                                    description=(
+                                        f"{theme.upperDivider}\n"
+                                        f"{theme.chartIcon} **Type:** All Alliances ({len(alliances)} total)\n"
+                                        f"{theme.allianceIcon} **Alliances:** {len(alliances)} alliances\n"
+                                        f"{theme.pinIcon} **Status:** Queued\n"
+                                        f"{theme.levelIcon} **Queue Position:** {initial_queue_pos}\n"
+                                        f"{theme.lowerDivider}"
+                                    ),
+                                    color=theme.emColor1
                                 )
-                                progress_embed.add_field(name="Alliances", value=str(len(alliances)), inline=True)
-                                progress_embed.add_field(name="Queue Position", value=f"#{initial_queue_pos}", inline=True)
-                                progress_embed.add_field(name="Status", value="Waiting to start…", inline=True)
                                 await select_interaction.response.send_message(embed=progress_embed, ephemeral=True)
                                 msg = await select_interaction.original_response()
                                 message_id = msg.id
@@ -486,12 +519,17 @@ class Alliance(commands.Cog):
                                 queue_position = queue_info['queue_size'] + 1
                                 
                                 status_embed = discord.Embed(
-                                    title=f"⏳  Queued — {alliance_name}",
-                                    color=0xFEE75C
+                                    title=f"{theme.hourglassIcon} Alliance Control Operation",
+                                    description=(
+                                        f"{theme.upperDivider}\n"
+                                        f"{theme.chartIcon} **Type:** Single Alliance\n"
+                                        f"{theme.allianceIcon} **Alliance:** {alliance_name}\n"
+                                        f"{theme.pinIcon} **Status:** Queued\n"
+                                        f"{theme.levelIcon} **Queue Position:** {queue_position}\n"
+                                        f"{theme.lowerDivider}"
+                                    ),
+                                    color=theme.emColor1
                                 )
-                                status_embed.add_field(name="Alliance", value=alliance_name, inline=True)
-                                status_embed.add_field(name="Queue Position", value=f"#{queue_position}", inline=True)
-                                status_embed.add_field(name="Status", value="Waiting to start…", inline=True)
                                 await select_interaction.response.send_message(embed=status_embed, ephemeral=True)
                                 msg = await select_interaction.original_response()
                                 
@@ -515,14 +553,18 @@ class Alliance(commands.Cog):
                     view.add_item(select)
 
                     embed = discord.Embed(
-                        title="🔍  Alliance Control",
+                        title=f"{theme.searchIcon} Alliance Control",
                         description=(
-                            "Select an alliance from the dropdown to run a control check.\n"
-                            "Choose **Check All** to process every alliance at once.\n\n"
-                            "> Results will appear in each alliance's designated channel.\n"
-                            "> Queued operations run one at a time."
+                            f"Please select an alliance to check:\n\n"
+                            f"**Information**\n"
+                            f"{theme.upperDivider}\n"
+                            f"• Select 'Check All Alliances' to process all alliances\n"
+                            f"• Control process may take a few minutes\n"
+                            f"• Results will be shared in the designated channel\n"
+                            f"• Other controls will be queued during the process\n"
+                            f"{theme.lowerDivider}"
                         ),
-                        color=0x5865F2
+                        color=theme.emColor1
                     )
                     await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
@@ -536,7 +578,7 @@ class Alliance(commands.Cog):
                             await bot_ops_cog.show_bot_operations_menu(interaction)
                         else:
                             await interaction.response.send_message(
-                                "❌ Bot Operations module not found.",
+                                f"{theme.deniedIcon}Bot Operations module not found.",
                                 ephemeral=True
                             )
                     except Exception as e:
@@ -560,7 +602,7 @@ class Alliance(commands.Cog):
                             await gift_ops_cog.show_gift_menu(interaction)
                         else:
                             await interaction.response.send_message(
-                                "❌ Gift Operations module not found.",
+                                f"{theme.deniedIcon}Gift Operations module not found.",
                                 ephemeral=True
                             )
                     except Exception as e:
@@ -577,15 +619,9 @@ class Alliance(commands.Cog):
                             )
 
                 elif custom_id == "add_alliance":
-                    if admin[1] != 1:
-                        await interaction.response.send_message("You do not have permission to perform this action.", ephemeral=True)
-                        return
                     await self.add_alliance(interaction)
 
                 elif custom_id == "delete_alliance":
-                    if admin[1] != 1:
-                        await interaction.response.send_message("You do not have permission to perform this action.", ephemeral=True)
-                        return
                     await self.delete_alliance(interaction)
 
                 elif custom_id == "view_alliances":
@@ -594,30 +630,6 @@ class Alliance(commands.Cog):
                 elif custom_id == "main_menu":
                     await self.show_main_menu(interaction)
 
-                elif custom_id == "support_operations":
-                    try:
-                        support_ops_cog = interaction.client.get_cog("SupportOperations")
-                        if support_ops_cog:
-                            await support_ops_cog.show_support_menu(interaction)
-                        else:
-                            await interaction.response.send_message(
-                                "❌ Support Operations module not found.",
-                                ephemeral=True
-                            )
-                    except Exception as e:
-                        if not any(error_code in str(e) for error_code in ["10062", "40060"]):
-                            print(f"Support operations error: {e}")
-                        if not interaction.response.is_done():
-                            await interaction.response.send_message(
-                                "An error occurred while loading Support Operations.", 
-                                ephemeral=True
-                            )
-                        else:
-                            await interaction.followup.send(
-                                "An error occurred while loading Support Operations.",
-                                ephemeral=True
-                            )
-
                 elif custom_id == "alliance_history":
                     try:
                         changes_cog = interaction.client.get_cog("Changes")
@@ -625,7 +637,7 @@ class Alliance(commands.Cog):
                             await changes_cog.show_alliance_history_menu(interaction)
                         else:
                             await interaction.response.send_message(
-                                "❌ Alliance History module not found.",
+                                f"{theme.deniedIcon}Alliance History module not found.",
                                 ephemeral=True
                             )
                     except Exception as e:
@@ -648,7 +660,7 @@ class Alliance(commands.Cog):
                             await other_features_cog.show_other_features_menu(interaction)
                         else:
                             await interaction.response.send_message(
-                                "❌ Other Features module not found.",
+                                f"{theme.deniedIcon}Other Features module not found.",
                                 ephemeral=True
                             )
                     except Exception as e:
@@ -662,6 +674,30 @@ class Alliance(commands.Cog):
                         else:
                             await interaction.followup.send(
                                 "An error occurred while loading Other Features menu.",
+                                ephemeral=True
+                            )
+
+                elif custom_id == "theme_settings":
+                    try:
+                        theme_cog = interaction.client.get_cog("Theme")
+                        if theme_cog:
+                            await theme_cog.show_theme_menu(interaction)
+                        else:
+                            await interaction.response.send_message(
+                                f"{theme.deniedIcon} Theme module not found.",
+                                ephemeral=True
+                            )
+                    except Exception as e:
+                        if not any(error_code in str(e) for error_code in ["10062", "40060"]):
+                            print(f"Theme settings error: {e}")
+                        if not interaction.response.is_done():
+                            await interaction.response.send_message(
+                                "An error occurred while loading Theme settings.",
+                                ephemeral=True
+                            )
+                        else:
+                            await interaction.followup.send(
+                                "An error occurred while loading Theme settings.",
                                 ephemeral=True
                             )
 
@@ -686,76 +722,96 @@ class Alliance(commands.Cog):
         try:
             alliance_name = modal.name.value.strip()
             interval = int(modal.interval.value.strip())
+            start_time_raw = modal.start_time.value.strip() if modal.start_time.value else ""
+
+            # Validate start_time format (HH:MM) if provided
+            start_time = None
+            if start_time_raw:
+                import re
+                if re.match(r'^([01]?\d|2[0-3]):([0-5]\d)$', start_time_raw):
+                    # Normalize to HH:MM format
+                    parts = start_time_raw.split(':')
+                    start_time = f"{int(parts[0]):02d}:{int(parts[1]):02d}"
+                else:
+                    error_embed = discord.Embed(
+                        title="Error",
+                        description="Invalid start time format. Please use HH:MM (e.g., 14:00).",
+                        color=theme.emColor2
+                    )
+                    await modal.interaction.response.send_message(embed=error_embed, ephemeral=True)
+                    return
 
             embed = discord.Embed(
                 title="Channel Selection",
                 description=(
-                    "**Instructions:**\n"
-                    "━━━━━━━━━━━━━━━━━━━━━━\n"
-                    "Please select a channel for the alliance\n\n"
-                    "**Page:** 1/1\n"
+                    f"**Instructions:**\n"
+                    f"{theme.upperDivider}\n"
+                    f"Please select a channel for the alliance\n\n"
+                    f"**Page:** 1/1\n"
                     f"**Total Channels:** {len(interaction.guild.text_channels)}"
                 ),
-                color=discord.Color.blue()
+                color=theme.emColor1
             )
 
             async def channel_select_callback(select_interaction: discord.Interaction):
                 try:
                     self.c.execute("SELECT alliance_id FROM alliance_list WHERE name = ?", (alliance_name,))
                     existing_alliance = self.c.fetchone()
-                    
+
                     if existing_alliance:
                         error_embed = discord.Embed(
                             title="Error",
                             description="An alliance with this name already exists.",
-                            color=discord.Color.red()
+                            color=theme.emColor2
                         )
                         await select_interaction.response.edit_message(embed=error_embed, view=None)
                         return
 
                     channel_id = int(select_interaction.data["values"][0])
 
-                    self.c.execute("INSERT INTO alliance_list (name, discord_server_id) VALUES (?, ?)", 
+                    self.c.execute("INSERT INTO alliance_list (name, discord_server_id) VALUES (?, ?)",
                                  (alliance_name, interaction.guild.id))
                     alliance_id = self.c.lastrowid
-                    self.c.execute("INSERT INTO alliancesettings (alliance_id, channel_id, interval) VALUES (?, ?, ?)", 
-                                 (alliance_id, channel_id, interval))
+                    self.c.execute("INSERT INTO alliancesettings (alliance_id, channel_id, interval, start_time) VALUES (?, ?, ?, ?)",
+                                 (alliance_id, channel_id, interval, start_time))
                     self.conn.commit()
 
                     self.c_giftcode.execute("""
-                        INSERT INTO giftcodecontrol (alliance_id, status) 
+                        INSERT INTO giftcodecontrol (alliance_id, status)
                         VALUES (?, 1)
                     """, (alliance_id,))
                     self.conn_giftcode.commit()
 
                     result_embed = discord.Embed(
-                        title="✅ Alliance Successfully Created",
+                        title=f"{theme.verifiedIcon} Alliance Successfully Created",
                         description="The alliance has been created with the following details:",
-                        color=discord.Color.green()
+                        color=theme.emColor3
                     )
-                    
+
+                    start_time_display = f"{start_time} UTC" if start_time else "Not set (starts on bot startup)"
                     info_section = (
                         f"**🛡️ Alliance Name**\n{alliance_name}\n\n"
                         f"**🔢 Alliance ID**\n{alliance_id}\n\n"
                         f"**📢 Channel**\n<#{channel_id}>\n\n"
-                        f"**⏱️ Control Interval**\n{interval} minutes"
+                        f"**⏱️ Control Interval**\n{interval} minutes\n\n"
+                        f"**🕐 Fixed Start Time**\n{start_time_display}"
                     )
                     result_embed.add_field(name="Alliance Details", value=info_section, inline=False)
-                    
+
                     result_embed.set_footer(text="Alliance settings have been successfully saved")
                     result_embed.timestamp = discord.utils.utcnow()
-                    
+
                     await select_interaction.response.edit_message(embed=result_embed, view=None)
 
                 except Exception as e:
                     error_embed = discord.Embed(
                         title="Error",
                         description=f"Error creating alliance: {str(e)}",
-                        color=discord.Color.red()
+                        color=theme.emColor2
                     )
                     await select_interaction.response.edit_message(embed=error_embed, view=None)
 
-            channels = interaction.guild.text_channels
+            channels = modal.interaction.guild.text_channels
             view = PaginatedChannelView(channels, channel_select_callback)
             await modal.interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
@@ -763,34 +819,56 @@ class Alliance(commands.Cog):
             error_embed = discord.Embed(
                 title="Error",
                 description="Invalid interval value. Please enter a number.",
-                color=discord.Color.red()
+                color=theme.emColor2
             )
             await modal.interaction.response.send_message(embed=error_embed, ephemeral=True)
         except Exception as e:
             error_embed = discord.Embed(
                 title="Error",
                 description=f"Error: {str(e)}",
-                color=discord.Color.red()
+                color=theme.emColor2
             )
             await modal.interaction.response.send_message(embed=error_embed, ephemeral=True)
 
     async def edit_alliance(self, interaction: discord.Interaction):
-        self.c.execute("""
-            SELECT a.alliance_id, a.name, COALESCE(s.interval, 0) as interval, COALESCE(s.channel_id, 0) as channel_id 
-            FROM alliance_list a 
+        if interaction.guild is None:
+            await interaction.response.send_message(f"{theme.deniedIcon} This command must be used in a server.", ephemeral=True)
+            return
+
+        user_id = interaction.user.id
+        guild_id = interaction.guild.id
+
+        # Get alliances this admin can access
+        admin_alliances, is_global = PermissionManager.get_admin_alliances(user_id, guild_id)
+
+        if not admin_alliances:
+            no_alliance_embed = discord.Embed(
+                title=f"{theme.deniedIcon}No Alliances Found",
+                description="You don't have access to any alliances.",
+                color=theme.emColor2
+            )
+            return await interaction.response.send_message(embed=no_alliance_embed, ephemeral=True)
+
+        # Fetch full alliance details for the ones admin can access
+        alliance_ids = [a[0] for a in admin_alliances]
+        placeholders = ','.join('?' * len(alliance_ids))
+        self.c.execute(f"""
+            SELECT a.alliance_id, a.name, COALESCE(s.interval, 0) as interval, COALESCE(s.channel_id, 0) as channel_id
+            FROM alliance_list a
             LEFT JOIN alliancesettings s ON a.alliance_id = s.alliance_id
+            WHERE a.alliance_id IN ({placeholders})
             ORDER BY a.alliance_id ASC
-        """)
+        """, alliance_ids)
         alliances = self.c.fetchall()
-        
+
         if not alliances:
             no_alliance_embed = discord.Embed(
-                title="❌ No Alliances Found",
+                title=f"{theme.deniedIcon}No Alliances Found",
                 description=(
                     "There are no alliances registered in the database.\n"
                     "Please create an alliance first using the `/alliance create` command."
                 ),
-                color=discord.Color.red()
+                color=theme.emColor2
             )
             no_alliance_embed.set_footer(text="Use /alliance create to add a new alliance")
             return await interaction.response.send_message(embed=no_alliance_embed, ephemeral=True)
@@ -827,7 +905,8 @@ class Alliance(commands.Cog):
                 self.add_item(select)
                 
                 previous_button = discord.ui.Button(
-                    label="◀️",
+                    label="",
+                    emoji=f"{theme.prevIcon}",
                     style=discord.ButtonStyle.grey,
                     custom_id="previous",
                     disabled=(self.current_page == 0)
@@ -836,7 +915,8 @@ class Alliance(commands.Cog):
                 self.add_item(previous_button)
 
                 next_button = discord.ui.Button(
-                    label="▶️",
+                    label="",
+                    emoji=f"{theme.nextIcon}",
                     style=discord.ButtonStyle.grey,
                     custom_id="next",
                     disabled=(self.current_page == len(self.pages) - 1)
@@ -850,29 +930,29 @@ class Alliance(commands.Cog):
                 
                 embed = interaction.message.embeds[0]
                 embed.description = (
-                    "**Instructions:**\n"
-                    "━━━━━━━━━━━━━━━━━━━━━━\n"
-                    "1️⃣ Select an alliance from the dropdown menu\n"
-                    "2️⃣ Use ◀️ ▶️ buttons to navigate between pages\n\n"
+                    f"**Instructions:**\n"
+                    f"{theme.upperDivider}\n"
+                    f"{theme.num1Icon} Select an alliance from the dropdown menu\n"
+                    f"{theme.num2Icon} Use {theme.prevIcon} {theme.nextIcon} buttons to navigate between pages\n\n"
                     f"**Current Page:** {self.current_page + 1}/{self.total_pages}\n"
                     f"**Total Alliances:** {sum(len(page) for page in self.pages)}\n"
-                    "━━━━━━━━━━━━━━━━━━━━━━"
+                    f"{theme.lowerDivider}"
                 )
                 await interaction.response.edit_message(embed=embed, view=self)
 
             async def next_callback(self, interaction: discord.Interaction):
                 self.current_page = (self.current_page + 1) % len(self.pages)
                 self.update_view()
-                
+
                 embed = interaction.message.embeds[0]
                 embed.description = (
-                    "**Instructions:**\n"
-                    "━━━━━━━━━━━━━━━━━━━━━━\n"
-                    "1️⃣ Select an alliance from the dropdown menu\n"
-                    "2️⃣ Use ◀️ ▶️ buttons to navigate between pages\n\n"
+                    f"**Instructions:**\n"
+                    f"{theme.upperDivider}\n"
+                    f"{theme.num1Icon} Select an alliance from the dropdown menu\n"
+                    f"{theme.num2Icon} Use {theme.prevIcon} {theme.nextIcon} buttons to navigate between pages\n\n"
                     f"**Current Page:** {self.current_page + 1}/{self.total_pages}\n"
                     f"**Total Alliances:** {sum(len(page) for page in self.pages)}\n"
-                    "━━━━━━━━━━━━━━━━━━━━━━"
+                    f"{theme.lowerDivider}"
                 )
                 await interaction.response.edit_message(embed=embed, view=self)
 
@@ -880,18 +960,19 @@ class Alliance(commands.Cog):
             try:
                 alliance_id = int(select_interaction.data["values"][0])
                 alliance_data = next(a for a in alliances if a[0] == alliance_id)
-                
+
                 self.c.execute("""
-                    SELECT interval, channel_id 
-                    FROM alliancesettings 
+                    SELECT interval, channel_id, start_time
+                    FROM alliancesettings
                     WHERE alliance_id = ?
                 """, (alliance_id,))
                 settings_data = self.c.fetchone()
-                
+
                 modal = AllianceModal(
                     title="Edit Alliance",
                     default_name=alliance_data[1],
-                    default_interval=str(settings_data[0] if settings_data else 0)
+                    default_interval=str(settings_data[0] if settings_data else 0),
+                    default_start_time=settings_data[2] if settings_data and settings_data[2] else ""
                 )
                 await select_interaction.response.send_modal(modal)
                 await modal.wait()
@@ -899,69 +980,89 @@ class Alliance(commands.Cog):
                 try:
                     alliance_name = modal.name.value.strip()
                     interval = int(modal.interval.value.strip())
+                    start_time_raw = modal.start_time.value.strip() if modal.start_time.value else ""
+
+                    # Validate start_time format (HH:MM) if provided
+                    start_time = None
+                    if start_time_raw:
+                        import re
+                        if re.match(r'^([01]?\d|2[0-3]):([0-5]\d)$', start_time_raw):
+                            # Normalize to HH:MM format
+                            parts = start_time_raw.split(':')
+                            start_time = f"{int(parts[0]):02d}:{int(parts[1]):02d}"
+                        else:
+                            error_embed = discord.Embed(
+                                title="Error",
+                                description="Invalid start time format. Please use HH:MM (e.g., 14:00).",
+                                color=theme.emColor2
+                            )
+                            await modal.interaction.response.send_message(embed=error_embed, ephemeral=True)
+                            return
 
                     embed = discord.Embed(
-                        title="🔄 Channel Selection",
+                        title=f"{theme.retryIcon} Channel Selection",
                         description=(
-                            "**Current Channel Information**\n"
-                            "━━━━━━━━━━━━━━━━━━━━━━\n"
-                            f"📢 Current channel: {f'<#{settings_data[1]}>' if settings_data else 'Not set'}\n"
-                            "**Page:** 1/1\n"
+                            f"**Current Channel Information**\n"
+                            f"{theme.upperDivider}\n"
+                            f"{theme.announceIcon} Current channel: {f'<#{settings_data[1]}>' if settings_data else 'Not set'}\n"
+                            f"**Page:** 1/1\n"
                             f"**Total Channels:** {len(interaction.guild.text_channels)}\n"
-                            "━━━━━━━━━━━━━━━━━━━━━━"
+                            f"{theme.lowerDivider}"
                         ),
-                        color=discord.Color.blue()
+                        color=theme.emColor1
                     )
 
                     async def channel_select_callback(channel_interaction: discord.Interaction):
                         try:
                             channel_id = int(channel_interaction.data["values"][0])
 
-                            self.c.execute("UPDATE alliance_list SET name = ? WHERE alliance_id = ?", 
+                            self.c.execute("UPDATE alliance_list SET name = ? WHERE alliance_id = ?",
                                           (alliance_name, alliance_id))
-                            
+
                             if settings_data:
                                 self.c.execute("""
-                                    UPDATE alliancesettings 
-                                    SET channel_id = ?, interval = ? 
+                                    UPDATE alliancesettings
+                                    SET channel_id = ?, interval = ?, start_time = ?
                                     WHERE alliance_id = ?
-                                """, (channel_id, interval, alliance_id))
+                                """, (channel_id, interval, start_time, alliance_id))
                             else:
                                 self.c.execute("""
-                                    INSERT INTO alliancesettings (alliance_id, channel_id, interval)
-                                    VALUES (?, ?, ?)
-                                """, (alliance_id, channel_id, interval))
-                            
+                                    INSERT INTO alliancesettings (alliance_id, channel_id, interval, start_time)
+                                    VALUES (?, ?, ?, ?)
+                                """, (alliance_id, channel_id, interval, start_time))
+
                             self.conn.commit()
 
                             result_embed = discord.Embed(
-                                title="✅ Alliance Successfully Updated",
+                                title=f"{theme.verifiedIcon} Alliance Successfully Updated",
                                 description="The alliance details have been updated as follows:",
-                                color=discord.Color.green()
+                                color=theme.emColor3
                             )
-                            
+
+                            start_time_display = f"{start_time} UTC" if start_time else "Not set (starts on bot startup)"
                             info_section = (
                                 f"**🛡️ Alliance Name**\n{alliance_name}\n\n"
                                 f"**🔢 Alliance ID**\n{alliance_id}\n\n"
                                 f"**📢 Channel**\n<#{channel_id}>\n\n"
-                                f"**⏱️ Control Interval**\n{interval} minutes"
+                                f"**⏱️ Control Interval**\n{interval} minutes\n\n"
+                                f"**🕐 Fixed Start Time**\n{start_time_display}"
                             )
                             result_embed.add_field(name="Alliance Details", value=info_section, inline=False)
-                            
+
                             result_embed.set_footer(text="Alliance settings have been successfully saved")
                             result_embed.timestamp = discord.utils.utcnow()
-                            
+
                             await channel_interaction.response.edit_message(embed=result_embed, view=None)
 
                         except Exception as e:
                             error_embed = discord.Embed(
-                                title="❌ Error",
+                                title=f"{theme.deniedIcon}Error",
                                 description=f"An error occurred while updating the alliance: {str(e)}",
-                                color=discord.Color.red()
+                                color=theme.emColor2
                             )
                             await channel_interaction.response.edit_message(embed=error_embed, view=None)
 
-                    channels = interaction.guild.text_channels
+                    channels = modal.interaction.guild.text_channels
                     view = PaginatedChannelView(channels, channel_select_callback)
                     await modal.interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
@@ -969,22 +1070,22 @@ class Alliance(commands.Cog):
                     error_embed = discord.Embed(
                         title="Error",
                         description="Invalid interval value. Please enter a number.",
-                        color=discord.Color.red()
+                        color=theme.emColor2
                     )
                     await modal.interaction.response.send_message(embed=error_embed, ephemeral=True)
                 except Exception as e:
                     error_embed = discord.Embed(
                         title="Error",
                         description=f"Error: {str(e)}",
-                        color=discord.Color.red()
+                        color=theme.emColor2
                     )
                     await modal.interaction.response.send_message(embed=error_embed, ephemeral=True)
 
             except Exception as e:
                 error_embed = discord.Embed(
-                    title="❌ Error",
+                    title=f"{theme.deniedIcon}Error",
                     description=f"An error occurred: {str(e)}",
-                    color=discord.Color.red()
+                    color=theme.emColor2
                 )
                 if not select_interaction.response.is_done():
                     await select_interaction.response.send_message(embed=error_embed, ephemeral=True)
@@ -993,17 +1094,17 @@ class Alliance(commands.Cog):
 
         view = PaginatedAllianceView(option_pages, select_callback)
         embed = discord.Embed(
-            title="🛡️ Alliance Edit Menu",
+            title=f"{theme.shieldIcon} Alliance Edit Menu",
             description=(
-                "**Instructions:**\n"
-                "━━━━━━━━━━━━━━━━━━━━━━\n"
-                "1️⃣ Select an alliance from the dropdown menu\n"
-                "2️⃣ Use ◀️ ▶️ buttons to navigate between pages\n\n"
+                f"**Instructions:**\n"
+                f"{theme.upperDivider}\n"
+                f"{theme.num1Icon} Select an alliance from the dropdown menu\n"
+                f"{theme.num2Icon} Use {theme.prevIcon} {theme.nextIcon} buttons to navigate between pages\n\n"
                 f"**Current Page:** {1}/{total_pages}\n"
                 f"**Total Alliances:** {len(alliances)}\n"
-                "━━━━━━━━━━━━━━━━━━━━━━"
+                f"{theme.lowerDivider}"
             ),
-            color=discord.Color.blue()
+            color=theme.emColor1
         )
         embed.set_footer(text="Use the dropdown menu below to select an alliance")
         embed.timestamp = discord.utils.utcnow()
@@ -1012,14 +1113,33 @@ class Alliance(commands.Cog):
 
     async def delete_alliance(self, interaction: discord.Interaction):
         try:
-            self.c.execute("SELECT alliance_id, name FROM alliance_list ORDER BY name")
-            alliances = self.c.fetchall()
-            
+            if interaction.guild is None:
+                await interaction.response.send_message(f"{theme.deniedIcon} This command must be used in a server.", ephemeral=True)
+                return
+
+            user_id = interaction.user.id
+            guild_id = interaction.guild.id
+
+            # Get alliances this admin can access
+            admin_alliances, is_global = PermissionManager.get_admin_alliances(user_id, guild_id)
+
+            if not admin_alliances:
+                no_alliance_embed = discord.Embed(
+                    title=f"{theme.deniedIcon}No Alliances Found",
+                    description="You don't have access to any alliances.",
+                    color=theme.emColor2
+                )
+                await interaction.response.send_message(embed=no_alliance_embed, ephemeral=True)
+                return
+
+            # Use the alliances from permission manager (already has id, name)
+            alliances = admin_alliances
+
             if not alliances:
                 no_alliance_embed = discord.Embed(
-                    title="❌ No Alliances Found",
+                    title=f"{theme.deniedIcon}No Alliances Found",
                     description="There are no alliances to delete.",
-                    color=discord.Color.red()
+                    color=theme.emColor2
                 )
                 await interaction.response.send_message(embed=no_alliance_embed, ephemeral=True)
                 return
@@ -1035,27 +1155,27 @@ class Alliance(commands.Cog):
                 discord.SelectOption(
                     label=f"{name[:40]} (ID: {alliance_id})",
                     value=f"{alliance_id}",
-                    description=f"👥 Members: {alliance_members[alliance_id]} | Click to delete",
-                    emoji="🗑️"
+                    description=f"{theme.membersIcon} Members: {alliance_members[alliance_id]} | Click to delete",
+                    emoji=theme.trashIcon
                 ) for alliance_id, name in alliances
             ]
             
             option_pages = [all_options[i:i + items_per_page] for i in range(0, len(all_options), items_per_page)]
             
             embed = discord.Embed(
-                title="🗑️ Delete Alliance",
+                title=f"{theme.trashIcon} Delete Alliance",
                 description=(
-                    "**⚠️ Warning: This action cannot be undone!**\n"
-                    "━━━━━━━━━━━━━━━━━━━━━━\n"
-                    "1️⃣ Select an alliance from the dropdown menu\n"
-                    "2️⃣ Use ◀️ ▶️ buttons to navigate between pages\n\n"
+                    f"**{theme.warnIcon} Warning: This action cannot be undone!**\n"
+                    f"{theme.upperDivider}\n"
+                    f"{theme.num1Icon} Select an alliance from the dropdown menu\n"
+                    f"{theme.num2Icon} Use {theme.prevIcon} {theme.nextIcon} buttons to navigate between pages\n\n"
                     f"**Current Page:** 1/{len(option_pages)}\n"
                     f"**Total Alliances:** {len(alliances)}\n"
-                    "━━━━━━━━━━━━━━━━━━━━━━"
+                    f"{theme.lowerDivider}"
                 ),
-                color=discord.Color.red()
+                color=theme.emColor2
             )
-            embed.set_footer(text="⚠️ Warning: Deleting an alliance will remove all its data!")
+            embed.set_footer(text=f"{theme.warnIcon} Warning: Deleting an alliance will remove all its data!")
             embed.timestamp = discord.utils.utcnow()
 
             view = PaginatedDeleteView(option_pages, self.alliance_delete_callback)
@@ -1065,9 +1185,9 @@ class Alliance(commands.Cog):
         except Exception as e:
             print(f"Error in delete_alliance: {e}")
             error_embed = discord.Embed(
-                title="❌ Error",
+                title=f"{theme.deniedIcon}Error",
                 description="An error occurred while loading the delete menu.",
-                color=discord.Color.red()
+                color=theme.emColor2
             )
             await interaction.response.send_message(embed=error_embed, ephemeral=True)
 
@@ -1106,24 +1226,24 @@ class Alliance(commands.Cog):
             alliance_logs_count = self.c_settings.fetchone()[0]
 
             confirm_embed = discord.Embed(
-                title="⚠️ Confirm Alliance Deletion",
+                title=f"{theme.warnIcon} Confirm Alliance Deletion",
                 description=(
                     f"Are you sure you want to delete this alliance?\n\n"
                     f"**Alliance Details:**\n"
-                    f"🛡️ **Name:** {alliance_name}\n"
-                    f"🔢 **ID:** {alliance_id}\n"
-                    f"👥 **Members:** {users_count}\n\n"
+                    f"{theme.allianceIcon} **Name:** {alliance_name}\n"
+                    f"{theme.levelIcon} **ID:** {alliance_id}\n"
+                    f"{theme.membersIcon} **Members:** {users_count}\n\n"
                     f"**Data to be Deleted:**\n"
-                    f"⚙️ Alliance Settings: {settings_count}\n"
-                    f"👥 User Records: {users_count}\n"
-                    f"🏰 Admin Server Records: {admin_server_count}\n"
-                    f"📢 Gift Channels: {gift_channels_count}\n"
-                    f"📊 Gift Code Controls: {gift_code_control_count}\n"
-                    f"🚫 Invalid ID Tracker: {invalid_tracker_count}\n"
-                    f"📋 Alliance Logs: {alliance_logs_count}\n\n"
-                    "**⚠️ WARNING: This action cannot be undone!**"
+                    f"{theme.settingsIcon} Alliance Settings: {settings_count}\n"
+                    f"{theme.membersIcon} User Records: {users_count}\n"
+                    f"{theme.allianceIcon} Admin Server Records: {admin_server_count}\n"
+                    f"{theme.announceIcon} Gift Channels: {gift_channels_count}\n"
+                    f"{theme.chartIcon} Gift Code Controls: {gift_code_control_count}\n"
+                    f"{theme.deniedIcon} Invalid ID Tracker: {invalid_tracker_count}\n"
+                    f"{theme.listIcon} Alliance Logs: {alliance_logs_count}\n\n"
+                    f"**{theme.warnIcon} WARNING: This action cannot be undone!**"
                 ),
-                color=discord.Color.red()
+                color=theme.emColor2
             )
             
             confirm_view = discord.ui.View(timeout=60)
@@ -1162,20 +1282,20 @@ class Alliance(commands.Cog):
                     self.conn_giftcode.commit()
 
                     cleanup_embed = discord.Embed(
-                        title="✅ Alliance Successfully Deleted",
+                        title=f"{theme.verifiedIcon} Alliance Successfully Deleted",
                         description=(
                             f"Alliance **{alliance_name}** has been deleted.\n\n"
                             "**Cleaned Up Data:**\n"
-                            f"🛡️ Alliance Records: {alliance_count}\n"
-                            f"👥 Users Removed: {users_count_deleted}\n"
-                            f"⚙️ Alliance Settings: {admin_settings_count}\n"
-                            f"🏰 Admin Server Records: {admin_server_count}\n"
-                            f"📢 Gift Channels: {gift_channels_count}\n"
-                            f"📊 Gift Code Controls: {gift_code_control_count}\n"
-                            f"🚫 Invalid ID Tracker: {invalid_tracker_deleted}\n"
-                            f"📋 Alliance Logs: {alliance_logs_deleted}"
+                            f"{theme.allianceIcon} Alliance Records: {alliance_count}\n"
+                            f"{theme.membersIcon} Users Removed: {users_count_deleted}\n"
+                            f"{theme.settingsIcon} Alliance Settings: {admin_settings_count}\n"
+                            f"{theme.allianceIcon} Admin Server Records: {admin_server_count}\n"
+                            f"{theme.announceIcon} Gift Channels: {gift_channels_count}\n"
+                            f"{theme.chartIcon} Gift Code Controls: {gift_code_control_count}\n"
+                            f"{theme.deniedIcon} Invalid ID Tracker: {invalid_tracker_deleted}\n"
+                            f"{theme.listIcon} Alliance Logs: {alliance_logs_deleted}"
                         ),
-                        color=discord.Color.green()
+                        color=theme.emColor3
                     )
                     cleanup_embed.set_footer(text="All related data has been successfully removed")
                     cleanup_embed.timestamp = discord.utils.utcnow()
@@ -1184,17 +1304,17 @@ class Alliance(commands.Cog):
                     
                 except Exception as e:
                     error_embed = discord.Embed(
-                        title="❌ Error",
+                        title=f"{theme.deniedIcon}Error",
                         description=f"An error occurred while deleting the alliance: {str(e)}",
-                        color=discord.Color.red()
+                        color=theme.emColor2
                     )
                     await button_interaction.response.edit_message(embed=error_embed, view=None)
 
             async def cancel_callback(button_interaction: discord.Interaction):
                 cancel_embed = discord.Embed(
-                    title="❌ Deletion Cancelled",
+                    title=f"{theme.deniedIcon}Deletion Cancelled",
                     description="Alliance deletion has been cancelled.",
-                    color=discord.Color.grey()
+                    color=theme.emColor4
                 )
                 await button_interaction.response.edit_message(embed=cancel_embed, view=None)
 
@@ -1210,9 +1330,9 @@ class Alliance(commands.Cog):
         except Exception as e:
             print(f"Error in alliance_delete_callback: {e}")
             error_embed = discord.Embed(
-                title="❌ Error",
+                title=f"{theme.deniedIcon}Error",
                 description="An error occurred while processing the deletion.",
-                color=discord.Color.red()
+                color=theme.emColor2
             )
             if not interaction.response.is_done():
                 await interaction.response.send_message(embed=error_embed, ephemeral=True)
@@ -1220,9 +1340,9 @@ class Alliance(commands.Cog):
                 await interaction.followup.send(embed=error_embed, ephemeral=True)
 
 class AllianceModal(discord.ui.Modal):
-    def __init__(self, title: str, default_name: str = "", default_interval: str = "0"):
+    def __init__(self, title: str, default_name: str = "", default_interval: str = "0", default_start_time: str = ""):
         super().__init__(title=title)
-        
+
         self.name = discord.ui.TextInput(
             label="Alliance Name",
             placeholder="Enter alliance name",
@@ -1230,7 +1350,7 @@ class AllianceModal(discord.ui.Modal):
             required=True
         )
         self.add_item(self.name)
-        
+
         self.interval = discord.ui.TextInput(
             label="Control Interval (minutes)",
             placeholder="Enter interval (0 to disable)",
@@ -1238,6 +1358,15 @@ class AllianceModal(discord.ui.Modal):
             required=True
         )
         self.add_item(self.interval)
+
+        self.start_time = discord.ui.TextInput(
+            label="Fixed Start Time (UTC, optional)",
+            placeholder="HH:MM (e.g., 14:00) or leave empty",
+            default=default_start_time,
+            required=False,
+            max_length=5
+        )
+        self.add_item(self.start_time)
 
     async def on_submit(self, interaction: discord.Interaction):
         self.interaction = interaction
@@ -1262,7 +1391,8 @@ class PaginatedDeleteView(discord.ui.View):
         self.add_item(select)
         
         previous_button = discord.ui.Button(
-            label="◀️",
+            label="",
+            emoji=f"{theme.prevIcon}",
             style=discord.ButtonStyle.grey,
             custom_id="previous",
             disabled=(self.current_page == 0)
@@ -1271,7 +1401,8 @@ class PaginatedDeleteView(discord.ui.View):
         self.add_item(previous_button)
 
         next_button = discord.ui.Button(
-            label="▶️",
+            label="",
+            emoji=f"{theme.nextIcon}",
             style=discord.ButtonStyle.grey,
             custom_id="next",
             disabled=(self.current_page == len(self.pages) - 1)
@@ -1284,43 +1415,43 @@ class PaginatedDeleteView(discord.ui.View):
         self.update_view()
         
         embed = discord.Embed(
-            title="🗑️ Delete Alliance",
+            title=f"{theme.trashIcon} Delete Alliance",
             description=(
-                "**⚠️ Warning: This action cannot be undone!**\n"
-                "━━━━━━━━━━━━━━━━━━━━━━\n"
-                "1️⃣ Select an alliance from the dropdown menu\n"
-                "2️⃣ Use ◀️ ▶️ buttons to navigate between pages\n\n"
+                f"**{theme.warnIcon} Warning: This action cannot be undone!**\n"
+                f"{theme.upperDivider}\n"
+                f"{theme.num1Icon} Select an alliance from the dropdown menu\n"
+                f"{theme.num2Icon} Use {theme.prevIcon} {theme.nextIcon} buttons to navigate between pages\n\n"
                 f"**Current Page:** {self.current_page + 1}/{self.total_pages}\n"
                 f"**Total Alliances:** {sum(len(page) for page in self.pages)}\n"
-                "━━━━━━━━━━━━━━━━━━━━━━"
+                f"{theme.lowerDivider}"
             ),
-            color=discord.Color.red()
+            color=theme.emColor2
         )
-        embed.set_footer(text="⚠️ Warning: Deleting an alliance will remove all its data!")
+        embed.set_footer(text=f"{theme.warnIcon} Warning: Deleting an alliance will remove all its data!")
         embed.timestamp = discord.utils.utcnow()
-        
+
         await interaction.response.edit_message(embed=embed, view=self)
 
     async def next_callback(self, interaction: discord.Interaction):
         self.current_page = (self.current_page + 1) % len(self.pages)
         self.update_view()
-        
+
         embed = discord.Embed(
-            title="🗑️ Delete Alliance",
+            title=f"{theme.trashIcon} Delete Alliance",
             description=(
-                "**⚠️ Warning: This action cannot be undone!**\n"
-                "━━━━━━━━━━━━━━━━━━━━━━\n"
-                "1️⃣ Select an alliance from the dropdown menu\n"
-                "2️⃣ Use ◀️ ▶️ buttons to navigate between pages\n\n"
+                f"**{theme.warnIcon} Warning: This action cannot be undone!**\n"
+                f"{theme.upperDivider}\n"
+                f"{theme.num1Icon} Select an alliance from the dropdown menu\n"
+                f"{theme.num2Icon} Use {theme.prevIcon} {theme.nextIcon} buttons to navigate between pages\n\n"
                 f"**Current Page:** {self.current_page + 1}/{self.total_pages}\n"
                 f"**Total Alliances:** {sum(len(page) for page in self.pages)}\n"
-                "━━━━━━━━━━━━━━━━━━━━━━"
+                f"{theme.lowerDivider}"
             ),
-            color=discord.Color.red()
+            color=theme.emColor2
         )
-        embed.set_footer(text="⚠️ Warning: Deleting an alliance will remove all its data!")
+        embed.set_footer(text=f"{theme.warnIcon} Warning: Deleting an alliance will remove all its data!")
         embed.timestamp = discord.utils.utcnow()
-        
+
         await interaction.response.edit_message(embed=embed, view=self)
 
 class PaginatedChannelView(discord.ui.View):
@@ -1352,7 +1483,7 @@ class PaginatedChannelView(discord.ui.View):
                 label=channel_label,
                 value=str(channel.id),
                 description=option_description,
-                emoji="📢"
+                emoji=theme.announceIcon
             ))
         
         select = discord.ui.Select(
@@ -1364,7 +1495,8 @@ class PaginatedChannelView(discord.ui.View):
         
         if self.total_pages > 1:
             previous_button = discord.ui.Button(
-                label="◀️",
+                label="",
+                emoji=f"{theme.prevIcon}",
                 style=discord.ButtonStyle.grey,
                 custom_id="previous",
                 disabled=(self.current_page == 0)
@@ -1373,7 +1505,8 @@ class PaginatedChannelView(discord.ui.View):
             self.add_item(previous_button)
 
             next_button = discord.ui.Button(
-                label="▶️",
+                label="",
+                emoji=f"{theme.nextIcon}",
                 style=discord.ButtonStyle.grey,
                 custom_id="next",
                 disabled=(self.current_page == len(self.pages) - 1)

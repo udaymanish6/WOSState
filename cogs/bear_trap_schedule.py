@@ -10,6 +10,8 @@ import logging
 import logging.handlers
 import asyncio
 from .bear_event_types import get_event_icon
+from .permission_handler import PermissionManager
+from .pimp_my_bot import theme
 
 class BearTrapSchedule(commands.Cog):
     def __init__(self, bot):
@@ -87,6 +89,10 @@ class BearTrapSchedule(commands.Cog):
             self.cursor.execute("ALTER TABLE notification_schedule_boards ADD COLUMN hide_daily_reset INTEGER DEFAULT 1")
 
         self.conn.commit()
+
+        # Single lock for board updates
+        self._board_update_lock = asyncio.Lock()
+
         self.logger.info("[SCHEDULE] Cog initialized successfully")
 
     async def cog_load(self):
@@ -178,6 +184,8 @@ class BearTrapSchedule(commands.Cog):
 
                     except Exception as e:
                         self.logger.error(f"[SCHEDULE] Error refreshing timezone {tz_str}: {e}")
+                        print(f"[ERROR] Error refreshing timezone {tz_str}: {e}")
+                        self.conn.rollback()
                         continue
 
                 # Sleep for 60 seconds before next check
@@ -185,27 +193,28 @@ class BearTrapSchedule(commands.Cog):
 
             except Exception as e:
                 self.logger.error(f"[SCHEDULE] Error in daily refresh loop: {e}")
+                print(f"[ERROR] Error in daily refresh loop: {e}")
+                self.conn.rollback()
                 await asyncio.sleep(60)  # Continue even if error occurs
 
     async def urgency_update_loop(self):
         """Background task that updates boards when events transition to SOON or IMMINENT"""
         await self.bot.wait_until_ready()
 
+        # Stagger by 30 seconds to reduce collision with daily_refresh_loop
+        await asyncio.sleep(30)
+
         while not self.bot.is_closed():
             try:
                 now_utc = datetime.now(pytz.UTC)
 
                 # Get all notifications that are approaching
-                svs_conn = sqlite3.connect('db/svs.sqlite')
-                svs_cursor = svs_conn.cursor()
-
-                svs_cursor.execute("""
+                self.cursor.execute("""
                     SELECT id, channel_id, next_notification
                     FROM bear_notifications
                     WHERE is_enabled = 1 AND next_notification IS NOT NULL
                 """)
-                notifications = svs_cursor.fetchall()
-                svs_conn.close()
+                notifications = self.cursor.fetchall()
 
                 boards_to_update = set()
 
@@ -229,17 +238,21 @@ class BearTrapSchedule(commands.Cog):
 
                         if crossing_threshold:
                             # Find all boards that should show this notification
+                            channel = self.bot.get_channel(channel_id)
+                            if not channel:
+                                continue  # Skip if channel not accessible
+
+                            guild_id = channel.guild.id
+
                             self.cursor.execute("""
                                 SELECT DISTINCT nsb.id
                                 FROM notification_schedule_boards nsb
-                                WHERE nsb.guild_id IN (
-                                    SELECT guild_id FROM channels WHERE id = ?
-                                )
+                                WHERE nsb.guild_id = ?
                                 AND (
                                     (nsb.board_type = 'server')
                                     OR (nsb.board_type = 'channel' AND nsb.target_channel_id = ?)
                                 )
-                            """, (channel_id, channel_id))
+                            """, (guild_id, channel_id))
 
                             for (board_id,) in self.cursor.fetchall():
                                 boards_to_update.add(board_id)
@@ -259,6 +272,8 @@ class BearTrapSchedule(commands.Cog):
 
             except Exception as e:
                 self.logger.error(f"[SCHEDULE] Error in urgency update loop: {e}")
+                print(f"[ERROR] Error in urgency update loop: {e}")
+                self.conn.rollback()
                 await asyncio.sleep(300)  # Continue even if error occurs
 
     async def create_schedule_board(self, guild_id: int, channel_id: int, board_type: str,
@@ -275,6 +290,15 @@ class BearTrapSchedule(commands.Cog):
             # Check bot permissions
             if not channel.permissions_for(channel.guild.me).send_messages:
                 return (None, "Bot doesn't have permission to send messages in that channel!")
+
+            # Check if a board with same configuration already exists
+            self.cursor.execute("""
+                SELECT id FROM notification_schedule_boards
+                WHERE guild_id = ? AND channel_id = ? AND board_type = ? AND target_channel_id = ?
+            """, (guild_id, channel_id, board_type, target_channel_id))
+            existing = self.cursor.fetchone()
+            if existing:
+                return (None, "A board with this configuration already exists in this channel. Delete the existing board first or choose a different channel.")
 
             # Generate initial embed
             embed = await self.generate_schedule_embed_for_new_board(
@@ -390,7 +414,8 @@ class BearTrapSchedule(commands.Cog):
             # Fetch board info
             self.cursor.execute("""
                 SELECT guild_id, channel_id, message_id, board_type, target_channel_id,
-                       max_events, show_disabled, auto_pin, timezone, filter_name, filter_time_range, show_repeating_events
+                       max_events, show_disabled, auto_pin, timezone, filter_name, filter_time_range,
+                       show_repeating_events, use_user_timezone, hide_daily_reset
                 FROM notification_schedule_boards
                 WHERE id = ?
             """, (board_id,))
@@ -400,7 +425,8 @@ class BearTrapSchedule(commands.Cog):
                 return (False, "Board not found!")
 
             (guild_id, old_channel_id, old_message_id, board_type, target_channel_id,
-             max_events, show_disabled, auto_pin, timezone, filter_name, filter_time_range, show_repeating_events) = result
+             max_events, show_disabled, auto_pin, timezone, filter_name, filter_time_range,
+             show_repeating_events, use_user_timezone, hide_daily_reset) = result
 
             # Get new channel
             new_channel = self.bot.get_channel(new_channel_id)
@@ -419,7 +445,9 @@ class BearTrapSchedule(commands.Cog):
                 'timezone': timezone,
                 'filter_name': filter_name,
                 'filter_time_range': filter_time_range,
-                'show_repeating_events': bool(show_repeating_events) if show_repeating_events is not None else True
+                'show_repeating_events': bool(show_repeating_events) if show_repeating_events is not None else True,
+                'use_user_timezone': use_user_timezone if use_user_timezone is not None else 0,
+                'hide_daily_reset': bool(hide_daily_reset) if hide_daily_reset is not None else True
             }
 
             embed = await self.generate_schedule_embed_for_new_board(
@@ -696,7 +724,7 @@ class BearTrapSchedule(commands.Cog):
             else:
                 tz_display = self._format_timezone_display(settings.get('timezone', 'UTC'))
                 tz_info = f"Showing all upcoming events {channel_text}in {tz_display}."
-            description = f"📅 **Upcoming Event Schedule**\n{tz_info}\n\n"
+            description = f"{theme.calendarIcon} **Upcoming Event Schedule**\n{tz_info}\n\n"
 
             # Helper function to format section with day grouping
             async def format_section_with_days(events, show_channel):
@@ -744,18 +772,18 @@ class BearTrapSchedule(commands.Cog):
                 description += await format_section_with_days(sections['upcoming'], board_type == 'server') + "\n\n"
 
             if sections['this_week']:
-                description += "📅 **2-7 DAYS**\n"
+                description += f"{theme.calendarIcon} **2-7 DAYS**\n"
                 description += await format_section_with_days(sections['this_week'], board_type == 'server') + "\n\n"
 
             if sections['next_week']:
-                description += "📆 **1-2 WEEKS**\n"
+                description += f"{theme.calendarIcon} **1-2 WEEKS**\n"
                 description += await format_section_with_days(sections['next_week'], board_type == 'server') + "\n\n"
 
             if sections['later']:
                 description += "🗓️ **FUTURE** (14+ days)\n"
                 description += await format_section_with_days(sections['later'], board_type == 'server') + "\n\n"
 
-            description += "━━━━━━━━━━━━━━━━━━━━━━"
+            description += theme.lowerDivider
 
             # Determine embed color based on nearest event
             if sections['imminent']:
@@ -866,7 +894,7 @@ class BearTrapSchedule(commands.Cog):
                 line += f" <#{channel_id}>"
 
             if not is_enabled:
-                line += " ⚠️ [DISABLED]"
+                line += f" {theme.warnIcon} [DISABLED]"
 
             return line
 
@@ -886,14 +914,14 @@ class BearTrapSchedule(commands.Cog):
         else:
             tz_display = self._format_timezone_display(settings.get('timezone', 'UTC'))
             tz_info = f"Showing all upcoming events {channel_text}in {tz_display}."
-        description = f"📅 **Upcoming Event Schedule**\n{tz_info}\n\n"
+        description = f"{theme.calendarIcon} **Upcoming Event Schedule**\n{tz_info}\n\n"
 
         if settings.get('filter_time_range'):
             description += f"No events in the next {settings['filter_time_range']} hours.\n\n"
         else:
             description += "No upcoming events scheduled.\n\n"
 
-        description += "━━━━━━━━━━━━━━━━━━━━━━"
+        description += theme.lowerDivider
 
         tz = self._get_timezone_object(settings.get('timezone', 'UTC'))
         now = datetime.now(pytz.UTC).astimezone(tz)
@@ -915,7 +943,7 @@ class BearTrapSchedule(commands.Cog):
     def _create_error_embed(self, error_message: str) -> discord.Embed:
         """Creates an error embed"""
         return discord.Embed(
-            title="❌ Error",
+            title=f"{theme.deniedIcon} Error",
             description=error_message,
             color=0xFF0000
         )
@@ -1015,66 +1043,68 @@ class BearTrapSchedule(commands.Cog):
         Updates a schedule board by regenerating and editing the Discord message.
         Returns True if successful, False otherwise.
         """
-        try:
-            # Fetch board info
-            self.cursor.execute("""
-                SELECT channel_id, message_id FROM notification_schedule_boards
-                WHERE id = ?
-            """, (board_id,))
-            result = self.cursor.fetchone()
-
-            if not result:
-                print(f"[WARNING] Board {board_id} not found in database")
-                return False
-
-            channel_id, message_id = result
-
-            # Get channel and message
-            channel = self.bot.get_channel(channel_id)
-            if not channel:
-                print(f"[WARNING] Channel {channel_id} not found, removing board {board_id}")
-                self.cursor.execute("DELETE FROM notification_schedule_boards WHERE id = ?", (board_id,))
-                self.conn.commit()
-                return False
-
+        # Acquire lock to prevent concurrent updates
+        async with self._board_update_lock:
             try:
-                message = await channel.fetch_message(message_id)
-            except discord.NotFound:
-                print(f"[WARNING] Message {message_id} not found, removing board {board_id}")
-                self.cursor.execute("DELETE FROM notification_schedule_boards WHERE id = ?", (board_id,))
+                # Fetch board info
+                self.cursor.execute("""
+                    SELECT channel_id, message_id FROM notification_schedule_boards
+                    WHERE id = ?
+                """, (board_id,))
+                result = self.cursor.fetchone()
+
+                if not result:
+                    print(f"[WARNING] Board {board_id} not found in database")
+                    return False
+
+                channel_id, message_id = result
+
+                # Get channel and message
+                channel = self.bot.get_channel(channel_id)
+                if not channel:
+                    print(f"[WARNING] Channel {channel_id} not found, removing board {board_id}")
+                    self.cursor.execute("DELETE FROM notification_schedule_boards WHERE id = ?", (board_id,))
+                    self.conn.commit()
+                    return False
+
+                try:
+                    message = await channel.fetch_message(message_id)
+                except discord.NotFound:
+                    print(f"[WARNING] Message {message_id} not found, removing board {board_id}")
+                    self.cursor.execute("DELETE FROM notification_schedule_boards WHERE id = ?", (board_id,))
+                    self.conn.commit()
+                    return False
+                except Exception as e:
+                    print(f"[ERROR] Failed to fetch message: {e}")
+                    return False
+
+                # Generate new embed
+                embed = await self.generate_schedule_embed(board_id, page=0)
+
+                # Create pagination view
+                total_pages = self._get_total_pages_from_footer(embed.footer.text if embed.footer else "")
+                view = ScheduleBoardPaginationView(self, board_id, current_page=0, total_pages=total_pages)
+
+                # Edit message
+                await message.edit(embed=embed, view=view)
+
+                # Update last_updated timestamp
+                self.cursor.execute("""
+                    UPDATE notification_schedule_boards
+                    SET last_updated = ?
+                    WHERE id = ?
+                """, (datetime.now(pytz.UTC).isoformat(), board_id))
                 self.conn.commit()
-                return False
+
+                self.logger.debug(f"[SCHEDULE] Board updated - ID: {board_id}")
+
+                return True
+
             except Exception as e:
-                print(f"[ERROR] Failed to fetch message: {e}")
+                self.logger.error(f"[SCHEDULE] Failed to update board {board_id}: {e}")
+                print(f"[ERROR] Failed to update board {board_id}: {e}")
+                self.conn.rollback()
                 return False
-
-            # Generate new embed
-            embed = await self.generate_schedule_embed(board_id, page=0)
-
-            # Create pagination view
-            total_pages = self._get_total_pages_from_footer(embed.footer.text if embed.footer else "")
-            view = ScheduleBoardPaginationView(self, board_id, current_page=0, total_pages=total_pages)
-
-            # Edit message
-            await message.edit(embed=embed, view=view)
-
-            # Update last_updated timestamp
-            self.cursor.execute("""
-                UPDATE notification_schedule_boards
-                SET last_updated = ?
-                WHERE id = ?
-            """, (datetime.now(pytz.UTC).isoformat(), board_id))
-            self.conn.commit()
-
-            self.logger.debug(f"[SCHEDULE] Board updated - ID: {board_id}")
-
-            return True
-
-        except Exception as e:
-            self.logger.error(f"[SCHEDULE] Failed to update board - ID: {board_id}, Error: {e}")
-            print(f"[ERROR] Failed to update schedule board {board_id}: {e}")
-            traceback.print_exc()
-            return False
 
     async def update_all_boards_for_guild(self, guild_id: int):
         """Updates all boards for a given server"""
@@ -1143,23 +1173,14 @@ class BearTrapSchedule(commands.Cog):
         await self.update_boards_for_notification_channel(guild_id, channel_id)
 
     async def check_admin(self, interaction: discord.Interaction) -> bool:
-        """Check if user is admin (same as bear_trap.py)"""
-        try:
-            admin_conn = sqlite3.connect('db/settings.sqlite')
-            admin_cursor = admin_conn.cursor()
-            admin_cursor.execute("SELECT id FROM admin WHERE id = ?", (interaction.user.id,))
-            is_admin = admin_cursor.fetchone() is not None
-            admin_conn.close()
-
-            if not is_admin:
-                await interaction.response.send_message(
-                    "❌ You don't have permission to use this command!",
-                    ephemeral=True
-                )
-            return is_admin
-        except Exception as e:
-            print(f"[ERROR] Error checking admin: {e}")
-            return False
+        """Check if user is admin"""
+        is_admin, _ = PermissionManager.is_admin(interaction.user.id)
+        if not is_admin:
+            await interaction.response.send_message(
+                f"{theme.deniedIcon} You don't have permission to use this command!",
+                ephemeral=True
+            )
+        return is_admin
 
     async def show_main_menu(self, interaction: discord.Interaction, force_new: bool = False):
         """Shows the main schedule board management menu
@@ -1182,13 +1203,13 @@ class BearTrapSchedule(commands.Cog):
             boards = self.cursor.fetchall()
 
             embed = discord.Embed(
-                title="📅 Schedule Board Management",
+                title=f"{theme.calendarIcon} Schedule Board Management",
                 description=(
                     "Manage automated schedule boards that display upcoming notifications.\n\n"
                     f"**Active Boards:** {len(boards)}\n\n"
                     "Use the buttons below to create or manage boards."
                 ),
-                color=discord.Color.blue()
+                color=theme.emColor1
             )
 
             view = ScheduleBoardMainView(self, interaction.guild.id, boards)
@@ -1207,12 +1228,12 @@ class BearTrapSchedule(commands.Cog):
             traceback.print_exc()
             try:
                 await interaction.response.send_message(
-                    "❌ An error occurred while loading the menu.",
+                    f"{theme.deniedIcon} An error occurred while loading the menu.",
                     ephemeral=True
                 )
             except discord.InteractionResponded:
                 await interaction.followup.send(
-                    "❌ An error occurred while loading the menu.",
+                    f"{theme.deniedIcon} An error occurred while loading the menu.",
                     ephemeral=True
                 )
 
@@ -1231,7 +1252,7 @@ class ScheduleBoardPaginationView(discord.ui.View):
         if current_page >= total_pages - 1:
             self.remove_item(self.next_button)
 
-    @discord.ui.button(label="◀️ Previous", style=discord.ButtonStyle.secondary, custom_id="schedule_prev", row=0)
+    @discord.ui.button(label="Previous", emoji=f"{theme.prevIcon}", style=discord.ButtonStyle.secondary, custom_id="schedule_prev", row=0)
     async def previous_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
             # Go to previous page
@@ -1252,9 +1273,9 @@ class ScheduleBoardPaginationView(discord.ui.View):
         except Exception as e:
             print(f"[ERROR] Pagination error: {e}")
             traceback.print_exc()
-            await interaction.response.send_message("❌ An error occurred!", ephemeral=True)
+            await interaction.response.send_message(f"{theme.deniedIcon} An error occurred!", ephemeral=True)
 
-    @discord.ui.button(label="▶️ Next", style=discord.ButtonStyle.secondary, custom_id="schedule_next", row=0)
+    @discord.ui.button(label="Next", emoji=f"{theme.nextIcon}", style=discord.ButtonStyle.secondary, custom_id="schedule_next", row=0)
     async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
             # Go to next page
@@ -1275,7 +1296,7 @@ class ScheduleBoardPaginationView(discord.ui.View):
         except Exception as e:
             print(f"[ERROR] Pagination error: {e}")
             traceback.print_exc()
-            await interaction.response.send_message("❌ An error occurred!", ephemeral=True)
+            await interaction.response.send_message(f"{theme.deniedIcon} An error occurred!", ephemeral=True)
 
     def _get_total_pages_from_embed(self, embed) -> int:
         """Extract total pages from embed footer"""
@@ -1303,48 +1324,48 @@ class ScheduleBoardMainView(discord.ui.View):
         if not boards:
             self.manage_board_button.disabled = True
 
-    @discord.ui.button(label="Create Board", emoji="➕", style=discord.ButtonStyle.primary, row=0)
+    @discord.ui.button(label="Create Board", emoji=f"{theme.addIcon}", style=discord.ButtonStyle.primary, row=0)
     async def create_board_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
             # Show board type selection view
             view = CreateBoardTypeView(self.cog, self.guild_id)
             embed = discord.Embed(
-                title="📅 Create Schedule Board - Step 1",
+                title=f"{theme.calendarIcon} Create Schedule Board - Step 1",
                 description=(
-                    "Choose the type of schedule board you want to create:\n\n"
-                    "**Board Types**\n"
-                    "━━━━━━━━━━━━━━━━━━━━━━\n"
-                    "🌐 **Server-Wide Board**\n"
-                    "└ Displays all notifications across all channels in the server\n"
-                    "└ Perfect for a central overview of all upcoming events\n"
-                    "📢 **Per-Channel Board**\n"
-                    "└ Displays notifications for a specific channel only\n"
-                    "└ Keeps channel-specific events organized\n"
-                    "└ Ideal for dedicated event channels (e.g., Bear Trap only)\n"
-                    "━━━━━━━━━━━━━━━━━━━━━━"
+                    f"Choose the type of schedule board you want to create:\n\n"
+                    f"**Board Types**\n"
+                    f"{theme.upperDivider}\n"
+                    f"{theme.globeIcon} **Server-Wide Board**\n"
+                    f"└ Displays all notifications across all channels in the server\n"
+                    f"└ Perfect for a central overview of all upcoming events\n"
+                    f"{theme.announceIcon} **Per-Channel Board**\n"
+                    f"└ Displays notifications for a specific channel only\n"
+                    f"└ Keeps channel-specific events organized\n"
+                    f"└ Ideal for dedicated event channels (e.g., Bear Trap only)\n"
+                    f"{theme.lowerDivider}"
                 ),
-                color=discord.Color.blue()
+                color=theme.emColor1
             )
             await interaction.response.edit_message(embed=embed, view=view)
         except Exception as e:
             print(f"[ERROR] Error in create board button: {e}")
             traceback.print_exc()
-            await interaction.followup.send("❌ An error occurred!", ephemeral=True)
+            await interaction.followup.send(f"{theme.deniedIcon} An error occurred!", ephemeral=True)
 
-    @discord.ui.button(label="Manage Boards", emoji="⚙️", style=discord.ButtonStyle.secondary, row=0)
+    @discord.ui.button(label="Manage Boards", emoji=f"{theme.settingsIcon}", style=discord.ButtonStyle.secondary, row=0)
     async def manage_board_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
             view = BoardSelectionView(self.cog, self.guild_id, self.boards, interaction.guild)
             embed = discord.Embed(
-                title="📋 Select Board to Manage",
+                title=f"{theme.listIcon} Select Board to Manage",
                 description=f"Choose from {len(self.boards)} board(s):",
-                color=discord.Color.blue()
+                color=theme.emColor1
             )
             await interaction.response.edit_message(embed=embed, view=view)
         except Exception as e:
             print(f"[ERROR] Error in manage board button: {e}")
             traceback.print_exc()
-            await interaction.followup.send("❌ An error occurred!", ephemeral=True)
+            await interaction.followup.send(f"{theme.deniedIcon} An error occurred!", ephemeral=True)
 
 class CreateBoardTypeView(discord.ui.View):
     """Step 1: Select board type with buttons"""
@@ -1353,25 +1374,25 @@ class CreateBoardTypeView(discord.ui.View):
         self.cog = cog
         self.guild_id = guild_id
 
-    @discord.ui.button(label="Server-Wide Board", emoji="🌐", style=discord.ButtonStyle.primary, row=0)
+    @discord.ui.button(label="Server-Wide Board", emoji=f"{theme.globeIcon}", style=discord.ButtonStyle.primary, row=0)
     async def server_board_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
             await self.proceed_to_channel_selection(interaction, "server")
         except Exception as e:
             print(f"[ERROR] Error in server board button: {e}")
             traceback.print_exc()
-            await interaction.followup.send("❌ An error occurred!", ephemeral=True)
+            await interaction.followup.send(f"{theme.deniedIcon} An error occurred!", ephemeral=True)
 
-    @discord.ui.button(label="Per-Channel Board", emoji="📢", style=discord.ButtonStyle.primary, row=0)
+    @discord.ui.button(label="Per-Channel Board", emoji=f"{theme.announceIcon}", style=discord.ButtonStyle.primary, row=0)
     async def channel_board_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
             await self.proceed_to_channel_selection(interaction, "channel")
         except Exception as e:
             print(f"[ERROR] Error in channel board button: {e}")
             traceback.print_exc()
-            await interaction.followup.send("❌ An error occurred!", ephemeral=True)
+            await interaction.followup.send(f"{theme.deniedIcon} An error occurred!", ephemeral=True)
 
-    @discord.ui.button(label="Back", emoji="◀️", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="Back", emoji=f"{theme.backIcon}", style=discord.ButtonStyle.secondary, row=1)
     async def back_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
             # Return to main schedule board menu
@@ -1391,12 +1412,12 @@ class CreateBoardTypeView(discord.ui.View):
             step_description = "**Step 2:** Select where to post the board"
 
         embed = discord.Embed(
-            title="📅 Create Schedule Board - Step 2",
+            title=f"{theme.calendarIcon} Create Schedule Board - Step 2",
             description=(
                 f"**Board Type:** {board_type.capitalize()}\n\n"
                 f"{step_description}"
             ),
-            color=discord.Color.blue()
+            color=theme.emColor1
         )
         await interaction.response.edit_message(embed=embed, view=view)
 
@@ -1451,7 +1472,7 @@ class CreateBoardChannelSelectView(discord.ui.View):
             # Check if we have required selections
             if self.board_type == "channel" and not self.target_channel_id:
                 await interaction.response.send_message(
-                    "❌ Please select the target channel first!",
+                    f"{theme.deniedIcon} Please select the target channel first!",
                     ephemeral=True
                 )
                 return
@@ -1462,7 +1483,7 @@ class CreateBoardChannelSelectView(discord.ui.View):
         except Exception as e:
             print(f"[ERROR] Error in display channel select: {e}")
             traceback.print_exc()
-            await interaction.followup.send("❌ An error occurred!", ephemeral=True)
+            await interaction.followup.send(f"{theme.deniedIcon} An error occurred!", ephemeral=True)
 
     async def show_settings(self, interaction: discord.Interaction):
         """Move to settings configuration"""
@@ -1477,7 +1498,7 @@ class CreateBoardChannelSelectView(discord.ui.View):
 
         target_info = f"<#{self.target_channel_id}>" if self.board_type == "channel" else "all channels"
         embed = discord.Embed(
-            title="📅 Create Schedule Board - Step 3",
+            title=f"{theme.calendarIcon} Create Schedule Board - Step 3",
             description=(
                 f"**Board Type:** {self.board_type.capitalize()}\n"
                 f"**Tracking:** {target_info}\n"
@@ -1500,7 +1521,7 @@ class CreateBoardChannelSelectView(discord.ui.View):
                 f"• Hide Daily Reset: {'Yes' if view.hide_daily_reset else 'No'}\n\n"
                 "Use the buttons below to adjust settings, then click **Create Board**."
             ),
-            color=discord.Color.blue()
+            color=theme.emColor1
         )
         await interaction.response.edit_message(embed=embed, view=view)
 
@@ -1525,7 +1546,7 @@ class CreateBoardSettingsView(discord.ui.View):
         self.use_user_timezone = False
         self.hide_daily_reset = True
 
-    @discord.ui.button(label="Max Events (15)", emoji="🔢", style=discord.ButtonStyle.secondary, row=0)
+    @discord.ui.button(label="Max Events (15)", emoji=f"{theme.chartIcon}", style=discord.ButtonStyle.secondary, row=0)
     async def max_events_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
             parent_view = self
@@ -1549,7 +1570,7 @@ class CreateBoardSettingsView(discord.ui.View):
                         value = int(self.max_events_input.value.strip())
                         if value < 1 or value > 100:
                             await modal_interaction.response.send_message(
-                                "❌ Max events must be between 1 and 100!",
+                                f"{theme.deniedIcon} Max events must be between 1 and 100!",
                                 ephemeral=True
                             )
                             return
@@ -1560,7 +1581,7 @@ class CreateBoardSettingsView(discord.ui.View):
 
                     except ValueError:
                         await modal_interaction.response.send_message(
-                            "❌ Please enter a valid number!",
+                            f"{theme.deniedIcon} Please enter a valid number!",
                             ephemeral=True
                         )
 
@@ -1571,7 +1592,7 @@ class CreateBoardSettingsView(discord.ui.View):
             print(f"[ERROR] Error in max events button: {e}")
             traceback.print_exc()
 
-    @discord.ui.button(label="Timezone (UTC)", emoji="🌍", style=discord.ButtonStyle.secondary, row=0)
+    @discord.ui.button(label="Timezone (UTC)", emoji=f"{theme.globeIcon}", style=discord.ButtonStyle.secondary, row=0)
     async def timezone_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
             parent_view = self
@@ -1611,7 +1632,7 @@ class CreateBoardSettingsView(discord.ui.View):
                                 parts = offset_str.split(':')
                                 if len(parts) != 2:
                                     await modal_interaction.response.send_message(
-                                        "❌ Invalid time format! Use HH:MM (e.g., 5:30)",
+                                        f"{theme.deniedIcon} Invalid time format! Use HH:MM (e.g., 5:30)",
                                         ephemeral=True
                                     )
                                     return
@@ -1620,7 +1641,7 @@ class CreateBoardSettingsView(discord.ui.View):
                                     minutes = int(parts[1])
                                     if minutes < 0 or minutes >= 60:
                                         await modal_interaction.response.send_message(
-                                            "❌ Minutes must be between 0 and 59!",
+                                            f"{theme.deniedIcon} Minutes must be between 0 and 59!",
                                             ephemeral=True
                                         )
                                         return
@@ -1628,7 +1649,7 @@ class CreateBoardSettingsView(discord.ui.View):
                                     offset = hours + (minutes / 60.0 if hours >= 0 else -minutes / 60.0)
                                 except ValueError:
                                     await modal_interaction.response.send_message(
-                                        "❌ Invalid time format! Use HH:MM (e.g., 5:30)",
+                                        f"{theme.deniedIcon} Invalid time format! Use HH:MM (e.g., 5:30)",
                                         ephemeral=True
                                     )
                                     return
@@ -1638,7 +1659,7 @@ class CreateBoardSettingsView(discord.ui.View):
                                     offset = float(offset_str)
                                 except ValueError:
                                     await modal_interaction.response.send_message(
-                                        "❌ Invalid offset! Use decimal (5.5) or HH:MM (5:30) format",
+                                        f"{theme.deniedIcon} Invalid offset! Use decimal (5.5) or HH:MM (5:30) format",
                                         ephemeral=True
                                     )
                                     return
@@ -1646,7 +1667,7 @@ class CreateBoardSettingsView(discord.ui.View):
                             # Validate offset range
                             if offset < -12 or offset > 14:
                                 await modal_interaction.response.send_message(
-                                    "❌ Timezone offset must be between UTC-12 and UTC+14!",
+                                    f"{theme.deniedIcon} Timezone offset must be between UTC-12 and UTC+14!",
                                     ephemeral=True
                                 )
                                 return
@@ -1671,7 +1692,7 @@ class CreateBoardSettingsView(discord.ui.View):
                             display_name = tz_input.upper()
                         else:
                             await modal_interaction.response.send_message(
-                                "❌ Invalid timezone format! Use UTC, UTC+3, UTC-5, UTC+5.5, etc.",
+                                f"{theme.deniedIcon} Invalid timezone format! Use UTC, UTC+3, UTC-5, UTC+5.5, etc.",
                                 ephemeral=True
                             )
                             return
@@ -1682,7 +1703,7 @@ class CreateBoardSettingsView(discord.ui.View):
                                 _ = pytz.timezone(tz_name)
                             except:
                                 await modal_interaction.response.send_message(
-                                    "❌ Invalid timezone!",
+                                    f"{theme.deniedIcon} Invalid timezone!",
                                     ephemeral=True
                                 )
                                 return
@@ -1694,7 +1715,7 @@ class CreateBoardSettingsView(discord.ui.View):
 
                     except Exception as e:
                         await modal_interaction.response.send_message(
-                            f"❌ Invalid timezone: {str(e)}",
+                            f"{theme.deniedIcon} Invalid timezone: {str(e)}",
                             ephemeral=True
                         )
 
@@ -1705,7 +1726,7 @@ class CreateBoardSettingsView(discord.ui.View):
             print(f"[ERROR] Error in timezone button: {e}")
             traceback.print_exc()
 
-    @discord.ui.button(label="User Timezone: No", emoji="🌐", style=discord.ButtonStyle.secondary, row=0)
+    @discord.ui.button(label="User Timezone: No", emoji=f"{theme.globeIcon}", style=discord.ButtonStyle.secondary, row=0)
     async def use_user_timezone_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
             self.use_user_timezone = not self.use_user_timezone
@@ -1718,7 +1739,7 @@ class CreateBoardSettingsView(discord.ui.View):
             print(f"[ERROR] Error in use user timezone button: {e}")
             traceback.print_exc()
 
-    @discord.ui.button(label="Show Disabled: No", emoji="👁️", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="Show Disabled: No", emoji=f"{theme.eyesIcon}", style=discord.ButtonStyle.secondary, row=1)
     async def show_disabled_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
             self.show_disabled = not self.show_disabled
@@ -1729,7 +1750,7 @@ class CreateBoardSettingsView(discord.ui.View):
             print(f"[ERROR] Error in show disabled button: {e}")
             traceback.print_exc()
 
-    @discord.ui.button(label="Pin Message: Yes", emoji="📌", style=discord.ButtonStyle.primary, row=0)
+    @discord.ui.button(label="Pin Message: Yes", emoji=f"{theme.pinIcon}", style=discord.ButtonStyle.primary, row=0)
     async def auto_pin_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
             self.auto_pin = not self.auto_pin
@@ -1740,7 +1761,7 @@ class CreateBoardSettingsView(discord.ui.View):
             print(f"[ERROR] Error in auto pin button: {e}")
             traceback.print_exc()
 
-    @discord.ui.button(label="Show Repeating: Yes", emoji="🔄", style=discord.ButtonStyle.primary, row=1)
+    @discord.ui.button(label="Show Repeating: Yes", emoji=f"{theme.refreshIcon}", style=discord.ButtonStyle.primary, row=1)
     async def show_repeating_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
             self.show_repeating_events = not self.show_repeating_events
@@ -1751,7 +1772,7 @@ class CreateBoardSettingsView(discord.ui.View):
             print(f"[ERROR] Error in show repeating button: {e}")
             traceback.print_exc()
 
-    @discord.ui.button(label="Hide Daily Reset: Yes", emoji="🔄", style=discord.ButtonStyle.primary, row=1)
+    @discord.ui.button(label="Hide Daily Reset: Yes", emoji=f"{theme.refreshIcon}", style=discord.ButtonStyle.primary, row=1)
     async def hide_daily_reset_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
             self.hide_daily_reset = not self.hide_daily_reset
@@ -1762,7 +1783,7 @@ class CreateBoardSettingsView(discord.ui.View):
             print(f"[ERROR] Error in hide daily reset button: {e}")
             traceback.print_exc()
 
-    @discord.ui.button(label="Create Board", emoji="✅", style=discord.ButtonStyle.success, row=2)
+    @discord.ui.button(label="Create Board", emoji=f"{theme.verifiedIcon}", style=discord.ButtonStyle.success, row=2)
     async def create_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
             # Create settings dict
@@ -1790,7 +1811,7 @@ class CreateBoardSettingsView(discord.ui.View):
             )
 
             if error:
-                await interaction.followup.send(f"❌ Failed to create board: {error}", ephemeral=True)
+                await interaction.followup.send(f"{theme.deniedIcon} Failed to create board: {error}", ephemeral=True)
                 return
 
             # Edit the existing message
@@ -1798,7 +1819,7 @@ class CreateBoardSettingsView(discord.ui.View):
             timezone_display = getattr(self, 'timezone_display', 'UTC')
 
             success_embed = discord.Embed(
-                title="✅ Schedule Board Created!",
+                title=f"{theme.verifiedIcon} Schedule Board Created!",
                 description=(
                     f"**Type:** {self.board_type.capitalize()}\n"
                     f"**Tracking:** {target_info}\n"
@@ -1810,7 +1831,7 @@ class CreateBoardSettingsView(discord.ui.View):
                     f"• Show Disabled: {'Yes' if self.show_disabled else 'No'}\n"
                     f"• Pin Message: {'Yes' if self.auto_pin else 'No'}"
                 ),
-                color=discord.Color.green()
+                color=theme.emColor3
             )
 
             # Create a view with back button
@@ -1820,9 +1841,9 @@ class CreateBoardSettingsView(discord.ui.View):
         except Exception as e:
             print(f"[ERROR] Error creating board: {e}")
             traceback.print_exc()
-            await interaction.followup.send("❌ An error occurred!", ephemeral=True)
+            await interaction.followup.send(f"{theme.deniedIcon} An error occurred!", ephemeral=True)
 
-    @discord.ui.button(label="Cancel", emoji="❌", style=discord.ButtonStyle.danger, row=2)
+    @discord.ui.button(label="Cancel", emoji=f"{theme.deniedIcon}", style=discord.ButtonStyle.danger, row=2)
     async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
             await self.cog.show_main_menu(interaction)
@@ -1837,7 +1858,7 @@ class CreateBoardSettingsView(discord.ui.View):
             timezone_display = getattr(self, 'timezone_display', 'UTC')
 
             embed = discord.Embed(
-                title="📅 Create Schedule Board - Step 3",
+                title=f"{theme.calendarIcon} Create Schedule Board - Step 3",
                 description=(
                     f"**Board Type:** {self.board_type.capitalize()}\n"
                     f"**Tracking:** {target_info}\n"
@@ -1860,7 +1881,7 @@ class CreateBoardSettingsView(discord.ui.View):
                     f"• Hide Daily Reset: {'Yes' if self.hide_daily_reset else 'No'}\n\n"
                     "Use the buttons below to adjust settings, then click **Create Board**."
                 ),
-                color=discord.Color.blue()
+                color=theme.emColor1
             )
             await interaction.response.edit_message(embed=embed, view=self)
         except Exception as e:
@@ -1874,7 +1895,7 @@ class BoardCreatedSuccessView(discord.ui.View):
         self.cog = cog
         self.guild_id = guild_id
 
-    @discord.ui.button(label="Back to Menu", emoji="🏠", style=discord.ButtonStyle.primary, row=0)
+    @discord.ui.button(label="Back to Menu", emoji=f"{theme.homeIcon}", style=discord.ButtonStyle.primary, row=0)
     async def back_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
             await self.cog.show_main_menu(interaction)
@@ -1936,7 +1957,7 @@ class CreateBoardSettingsModal(discord.ui.Modal):
                 tz = pytz.timezone(self.timezone.value.strip())
             except pytz.exceptions.UnknownTimeZoneError:
                 await interaction.response.send_message(
-                    "❌ Invalid timezone! Please use a valid timezone (e.g., UTC, America/New_York).",
+                    f"{theme.deniedIcon} Invalid timezone! Please use a valid timezone (e.g., UTC, America/New_York).",
                     ephemeral=True
                 )
                 return
@@ -1948,7 +1969,7 @@ class CreateBoardSettingsModal(discord.ui.Modal):
                     raise ValueError("Max events must be between 1 and 100")
             except ValueError:
                 await interaction.response.send_message(
-                    "❌ Invalid max events! Please enter a number between 1 and 100.",
+                    f"{theme.deniedIcon} Invalid max events! Please enter a number between 1 and 100.",
                     ephemeral=True
                 )
                 return
@@ -1979,13 +2000,13 @@ class CreateBoardSettingsModal(discord.ui.Modal):
             )
 
             if error:
-                await interaction.followup.send(f"❌ Failed to create board: {error}", ephemeral=True)
+                await interaction.followup.send(f"{theme.deniedIcon} Failed to create board: {error}", ephemeral=True)
                 return
 
             # Success!
             target_info = f"<#{self.target_channel_id}>" if self.board_type == "channel" else "all channels"
             await interaction.followup.send(
-                f"✅ **Schedule board created!**\n\n"
+                f"{theme.verifiedIcon} **Schedule board created!**\n\n"
                 f"**Type:** {self.board_type.capitalize()}\n"
                 f"**Tracking:** {target_info}\n"
                 f"**Posted in:** <#{self.display_channel_id}>\n"
@@ -1997,9 +2018,9 @@ class CreateBoardSettingsModal(discord.ui.Modal):
             print(f"[ERROR] Error in create board settings modal: {e}")
             traceback.print_exc()
             try:
-                await interaction.followup.send("❌ An error occurred!", ephemeral=True)
+                await interaction.followup.send(f"{theme.deniedIcon} An error occurred!", ephemeral=True)
             except:
-                await interaction.response.send_message("❌ An error occurred!", ephemeral=True)
+                await interaction.response.send_message(f"{theme.deniedIcon} An error occurred!", ephemeral=True)
 
 class BoardSelectionView(discord.ui.View):
     """View to select which board to manage"""
@@ -2043,7 +2064,7 @@ class BoardSelectionView(discord.ui.View):
                         label=label[:100],  # Discord limit
                         value=str(board_id),
                         description=description[:100],
-                        emoji="📋"
+                        emoji=f"{theme.listIcon}"
                     )
                 )
 
@@ -2058,7 +2079,7 @@ class BoardSelectionView(discord.ui.View):
             self.add_item(select)
 
         # Back button
-        back_btn = discord.ui.Button(label="Back", emoji="◀️", style=discord.ButtonStyle.secondary, row=1)
+        back_btn = discord.ui.Button(label="Back", emoji=f"{theme.prevIcon}", style=discord.ButtonStyle.secondary, row=1)
         back_btn.callback = self.back_callback
         self.add_item(back_btn)
 
@@ -2074,7 +2095,7 @@ class BoardSelectionView(discord.ui.View):
         except Exception as e:
             print(f"[ERROR] Error in board select: {e}")
             traceback.print_exc()
-            await interaction.followup.send("❌ An error occurred!", ephemeral=True)
+            await interaction.followup.send(f"{theme.deniedIcon} An error occurred!", ephemeral=True)
 
     async def back_callback(self, interaction: discord.Interaction):
         await self.cog.show_main_menu(interaction)
@@ -2112,9 +2133,9 @@ class BoardManagementView(discord.ui.View):
 
             if not result:
                 return discord.Embed(
-                    title="❌ Error",
+                    title=f"{theme.deniedIcon} Error",
                     description="Board not found!",
-                    color=discord.Color.red()
+                    color=theme.emColor2
                 )
 
             (board_type, target_channel_id, display_channel_id, max_events,
@@ -2123,7 +2144,7 @@ class BoardManagementView(discord.ui.View):
             target_info = f"<#{target_channel_id}>" if board_type == "channel" else "All channels"
 
             embed = discord.Embed(
-                title=f"📋 Managing Board #{self.board_id}",
+                title=f"{theme.listIcon} Managing Board #{self.board_id}",
                 description=(
                     f"**Type:** {board_type.capitalize()}\n"
                     f"**Tracking:** {target_info}\n"
@@ -2136,7 +2157,7 @@ class BoardManagementView(discord.ui.View):
                     f"• Show Repeating: {'Yes' if show_repeating_events else 'No'}\n\n"
                     f"Created: {created_at}"
                 ),
-                color=discord.Color.blue()
+                color=theme.emColor1
             )
 
             return embed
@@ -2145,12 +2166,12 @@ class BoardManagementView(discord.ui.View):
             print(f"[ERROR] Error creating board management embed: {e}")
             traceback.print_exc()
             return discord.Embed(
-                title="❌ Error",
+                title=f"{theme.deniedIcon} Error",
                 description="Failed to load board info",
-                color=discord.Color.red()
+                color=theme.emColor2
             )
 
-    @discord.ui.button(label="Edit Settings", emoji="✏️", style=discord.ButtonStyle.primary, row=0)
+    @discord.ui.button(label="Edit Settings", emoji=f"{theme.editListIcon}", style=discord.ButtonStyle.primary, row=0)
     async def edit_settings_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
             view = EditBoardSettingsView(self.cog, self.board_id, self.guild_id)
@@ -2196,9 +2217,9 @@ class BoardManagementView(discord.ui.View):
 
             await interaction.response.edit_message(
                 embed=discord.Embed(
-                    title="🔄 Change Tracking Channel",
+                    title=f"{theme.refreshIcon} Change Tracking Channel",
                     description="Select which channel's events this board should display:",
-                    color=discord.Color.blue()
+                    color=theme.emColor1
                 ),
                 view=view
             )
@@ -2207,7 +2228,7 @@ class BoardManagementView(discord.ui.View):
             print(f"[ERROR] Error in change tracking channel: {e}")
             traceback.print_exc()
 
-    @discord.ui.button(label="Move Board", emoji="📤", style=discord.ButtonStyle.secondary, row=0)
+    @discord.ui.button(label="Move Board", emoji=f"{theme.exportIcon}", style=discord.ButtonStyle.secondary, row=0)
     async def move_board_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
             channel_select = discord.ui.ChannelSelect(
@@ -2224,7 +2245,7 @@ class BoardManagementView(discord.ui.View):
                 success, error = await self.cog.move_schedule_board(self.board_id, new_channel_id)
 
                 if error:
-                    await select_interaction.followup.send(f"❌ Failed to move: {error}", ephemeral=True)
+                    await select_interaction.followup.send(f"{theme.deniedIcon} Failed to move: {error}", ephemeral=True)
                     return
 
                 # Refresh the board management view (no confirmation message)
@@ -2240,7 +2261,7 @@ class BoardManagementView(discord.ui.View):
                 embed=discord.Embed(
                     title="📤 Move Board",
                     description="Select where to post this schedule board:",
-                    color=discord.Color.blue()
+                    color=theme.emColor1
                 ),
                 view=view
             )
@@ -2249,13 +2270,13 @@ class BoardManagementView(discord.ui.View):
             print(f"[ERROR] Error in move board: {e}")
             traceback.print_exc()
 
-    @discord.ui.button(label="Change Tracking", emoji="🔄", style=discord.ButtonStyle.secondary, row=0)
+    @discord.ui.button(label="Change Tracking", emoji=f"{theme.refreshIcon}", style=discord.ButtonStyle.secondary, row=0)
     async def change_tracking_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Change which channel to monitor (only for per-channel boards)"""
         # This button is only visible for per-channel boards, hiding is done in __init__
         await self.change_target_channel_callback(interaction)
 
-    @discord.ui.button(label="Preview", emoji="👁️", style=discord.ButtonStyle.secondary, row=0)
+    @discord.ui.button(label="Preview", emoji=f"{theme.eyesIcon}", style=discord.ButtonStyle.secondary, row=0)
     async def preview_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
             await interaction.response.defer(ephemeral=True)
@@ -2268,23 +2289,23 @@ class BoardManagementView(discord.ui.View):
         except Exception as e:
             print(f"[ERROR] Error in preview: {e}")
             traceback.print_exc()
-            await interaction.followup.send("❌ An error occurred!", ephemeral=True)
+            await interaction.followup.send(f"{theme.deniedIcon} An error occurred!", ephemeral=True)
 
-    @discord.ui.button(label="Delete Board", emoji="🗑️", style=discord.ButtonStyle.danger, row=1)
+    @discord.ui.button(label="Delete Board", emoji=f"{theme.trashIcon}", style=discord.ButtonStyle.danger, row=1)
     async def delete_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
             view = ConfirmDeleteView(self.cog, self.guild_id, self.board_id)
             embed = discord.Embed(
-                title="⚠️ Confirm Deletion",
+                title=f"{theme.warnIcon} Confirm Deletion",
                 description=f"Are you sure you want to delete board #{self.board_id}?\n\nThis will remove the board message and cannot be undone.",
-                color=discord.Color.red()
+                color=theme.emColor2
             )
             await interaction.response.edit_message(embed=embed, view=view)
         except Exception as e:
             print(f"[ERROR] Error in delete button: {e}")
             traceback.print_exc()
 
-    @discord.ui.button(label="Back", emoji="◀️", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="Back", emoji=f"{theme.backIcon}", style=discord.ButtonStyle.secondary, row=1)
     async def back_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.cog.show_main_menu(interaction)
 
@@ -2370,20 +2391,20 @@ class EditBoardSettingsView(discord.ui.View):
             tz_line = f"🌍 **Timezone:** {tz_display}\n└ Times displayed in this timezone"
 
         embed = discord.Embed(
-            title=f"⚙️ Edit Board Settings - Board #{self.board_id}",
+            title=f"{theme.settingsIcon} Edit Board Settings - Board #{self.board_id}",
             description=(
-                "🔢 **Max Events:** {max}\n"
+                f"{theme.levelIcon} **Max Events:** {{max}}\n"
                 "└ Maximum number of events to display per page\n\n"
                 "{tz_line}\n\n"
-                "🌐 **User Timezone:** {user_tz}\n"
+                f"{theme.globeIcon} **User Timezone:** {{user_tz}}\n"
                 "└ Show times in each user's local timezone\n\n"
-                "👁️ **Show Disabled:** {disabled}\n"
+                f"{theme.eyesIcon} **Show Disabled:** {{disabled}}\n"
                 "└ Include disabled events in schedule\n\n"
-                "📌 **Pin Message:** {pin}\n"
+                f"{theme.pinIcon} **Pin Message:** {{pin}}\n"
                 "└ Keep this message pinned in channel\n\n"
-                "🔄 **Show Repeating:** {repeat}\n"
+                f"{theme.retryIcon} **Show Repeating:** {{repeat}}\n"
                 "└ Display future occurrences of repeating events\n\n"
-                "🔄 **Hide Daily Reset:** {hide_reset}\n"
+                f"{theme.retryIcon} **Hide Daily Reset:** {{hide_reset}}\n"
                 "└ Exclude Daily Reset from the schedule to reduce clutter\n\n"
                 "Click the buttons below to adjust settings."
             ).format(
@@ -2395,11 +2416,11 @@ class EditBoardSettingsView(discord.ui.View):
                 repeat='Yes' if self.show_repeating_events else 'No',
                 hide_reset='Yes' if self.hide_daily_reset else 'No'
             ),
-            color=discord.Color.blue()
+            color=theme.emColor1
         )
         return embed
 
-    @discord.ui.button(label="Max Events (15)", emoji="🔢", style=discord.ButtonStyle.secondary, row=0)
+    @discord.ui.button(label="Max Events (15)", emoji=f"{theme.chartIcon}", style=discord.ButtonStyle.secondary, row=0)
     async def max_events_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Edit max events through modal"""
         try:
@@ -2443,7 +2464,7 @@ class EditBoardSettingsView(discord.ui.View):
 
                     except ValueError:
                         await modal_interaction.response.send_message(
-                            "❌ Max events must be a number between 1 and 100!",
+                            f"{theme.deniedIcon} Max events must be a number between 1 and 100!",
                             ephemeral=True
                         )
 
@@ -2453,7 +2474,7 @@ class EditBoardSettingsView(discord.ui.View):
             print(f"[ERROR] Error in max events button: {e}")
             traceback.print_exc()
 
-    @discord.ui.button(label="Timezone (UTC)", emoji="🌍", style=discord.ButtonStyle.secondary, row=0)
+    @discord.ui.button(label="Timezone (UTC)", emoji=f"{theme.globeIcon}", style=discord.ButtonStyle.secondary, row=0)
     async def timezone_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Edit timezone through modal"""
         try:
@@ -2520,7 +2541,7 @@ class EditBoardSettingsView(discord.ui.View):
 
                     except Exception as e:
                         await modal_interaction.response.send_message(
-                            f"❌ Invalid timezone format! Use UTC±X format (e.g., UTC+3, UTC-5).",
+                            f"{theme.deniedIcon} Invalid timezone format! Use UTC±X format (e.g., UTC+3, UTC-5).",
                             ephemeral=True
                         )
 
@@ -2530,7 +2551,7 @@ class EditBoardSettingsView(discord.ui.View):
             print(f"[ERROR] Error in timezone button: {e}")
             traceback.print_exc()
 
-    @discord.ui.button(label="User Timezone: No", emoji="🌐", style=discord.ButtonStyle.secondary, row=0)
+    @discord.ui.button(label="User Timezone: No", emoji=f"{theme.globeIcon}", style=discord.ButtonStyle.secondary, row=0)
     async def use_user_timezone_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Toggle user timezone setting"""
         try:
@@ -2559,7 +2580,7 @@ class EditBoardSettingsView(discord.ui.View):
             print(f"[ERROR] Error toggling user timezone: {e}")
             traceback.print_exc()
 
-    @discord.ui.button(label="Show Disabled: No", emoji="👁️", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="Show Disabled: No", emoji=f"{theme.eyesIcon}", style=discord.ButtonStyle.secondary, row=1)
     async def show_disabled_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Toggle show disabled events"""
         try:
@@ -2588,7 +2609,7 @@ class EditBoardSettingsView(discord.ui.View):
             print(f"[ERROR] Error toggling show disabled: {e}")
             traceback.print_exc()
 
-    @discord.ui.button(label="Pin Message: Yes", emoji="📌", style=discord.ButtonStyle.primary, row=1)
+    @discord.ui.button(label="Pin Message: Yes", emoji=f"{theme.pinIcon}", style=discord.ButtonStyle.primary, row=1)
     async def auto_pin_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Toggle pin message"""
         try:
@@ -2646,7 +2667,7 @@ class EditBoardSettingsView(discord.ui.View):
             print(f"[ERROR] Error toggling pin message: {e}")
             traceback.print_exc()
 
-    @discord.ui.button(label="Show Repeating: Yes", emoji="🔄", style=discord.ButtonStyle.primary, row=1)
+    @discord.ui.button(label="Show Repeating: Yes", emoji=f"{theme.refreshIcon}", style=discord.ButtonStyle.primary, row=1)
     async def show_repeating_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Toggle show repeating events"""
         try:
@@ -2675,7 +2696,7 @@ class EditBoardSettingsView(discord.ui.View):
             print(f"[ERROR] Error toggling show repeating: {e}")
             traceback.print_exc()
 
-    @discord.ui.button(label="Hide Daily Reset: Yes", emoji="🔄", style=discord.ButtonStyle.primary, row=2)
+    @discord.ui.button(label="Hide Daily Reset: Yes", emoji=f"{theme.refreshIcon}", style=discord.ButtonStyle.primary, row=2)
     async def hide_daily_reset_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Toggle hide daily reset events"""
         try:
@@ -2704,7 +2725,7 @@ class EditBoardSettingsView(discord.ui.View):
             print(f"[ERROR] Error toggling hide daily reset: {e}")
             traceback.print_exc()
 
-    @discord.ui.button(label="Done", emoji="✅", style=discord.ButtonStyle.success, row=2)
+    @discord.ui.button(label="Done", emoji=f"{theme.verifiedIcon}", style=discord.ButtonStyle.success, row=2)
     async def done_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Return to board management view"""
         try:
@@ -2783,7 +2804,7 @@ class EditBoardSettingsModal(discord.ui.Modal):
                         parts = offset_str.split(':')
                         if len(parts) != 2:
                             await interaction.response.send_message(
-                                "❌ Invalid time format! Use HH:MM (e.g., 5:30)",
+                                f"{theme.deniedIcon} Invalid time format! Use HH:MM (e.g., 5:30)",
                                 ephemeral=True
                             )
                             return
@@ -2792,7 +2813,7 @@ class EditBoardSettingsModal(discord.ui.Modal):
                             minutes = int(parts[1])
                             if minutes < 0 or minutes >= 60:
                                 await interaction.response.send_message(
-                                    "❌ Minutes must be between 0 and 59!",
+                                    f"{theme.deniedIcon} Minutes must be between 0 and 59!",
                                     ephemeral=True
                                 )
                                 return
@@ -2800,7 +2821,7 @@ class EditBoardSettingsModal(discord.ui.Modal):
                             offset = hours + (minutes / 60.0 if hours >= 0 else -minutes / 60.0)
                         except ValueError:
                             await interaction.response.send_message(
-                                "❌ Invalid time format! Use HH:MM (e.g., 5:30)",
+                                f"{theme.deniedIcon} Invalid time format! Use HH:MM (e.g., 5:30)",
                                 ephemeral=True
                             )
                             return
@@ -2810,14 +2831,14 @@ class EditBoardSettingsModal(discord.ui.Modal):
                             offset = float(offset_str)
                         except ValueError:
                             await interaction.response.send_message(
-                                "❌ Invalid offset! Use decimal (5.5) or HH:MM (5:30) format",
+                                f"{theme.deniedIcon} Invalid offset! Use decimal (5.5) or HH:MM (5:30) format",
                                 ephemeral=True
                             )
                             return
 
                     if offset < -12 or offset > 14:
                         await interaction.response.send_message(
-                            "❌ Timezone offset must be between UTC-12 and UTC+14!",
+                            f"{theme.deniedIcon} Timezone offset must be between UTC-12 and UTC+14!",
                             ephemeral=True
                         )
                         return
@@ -2840,13 +2861,13 @@ class EditBoardSettingsModal(discord.ui.Modal):
                         tz_name = f"UTC{sign}{hours:02d}:{minutes:02d}"
                 else:
                     await interaction.response.send_message(
-                        "❌ Invalid timezone format! Use UTC, UTC+3, UTC-5, UTC+5.5, etc.",
+                        f"{theme.deniedIcon} Invalid timezone format! Use UTC, UTC+3, UTC-5, UTC+5.5, etc.",
                         ephemeral=True
                     )
                     return
             except (ValueError, pytz.exceptions.UnknownTimeZoneError) as e:
                 await interaction.response.send_message(
-                    f"❌ Invalid timezone: {str(e)}",
+                    f"{theme.deniedIcon} Invalid timezone: {str(e)}",
                     ephemeral=True
                 )
                 return
@@ -2858,7 +2879,7 @@ class EditBoardSettingsModal(discord.ui.Modal):
                     raise ValueError()
             except ValueError:
                 await interaction.response.send_message(
-                    "❌ Max events must be between 1 and 100!",
+                    f"{theme.deniedIcon} Max events must be between 1 and 100!",
                     ephemeral=True
                 )
                 return
@@ -2893,7 +2914,7 @@ class EditBoardSettingsModal(discord.ui.Modal):
         except Exception as e:
             print(f"[ERROR] Error updating settings: {e}")
             traceback.print_exc()
-            await interaction.response.send_message("❌ An error occurred!", ephemeral=True)
+            await interaction.response.send_message(f"{theme.deniedIcon} An error occurred!", ephemeral=True)
 
 class ConfirmDeleteView(discord.ui.View):
     """Confirmation view for deleting a board"""
@@ -2903,7 +2924,7 @@ class ConfirmDeleteView(discord.ui.View):
         self.guild_id = guild_id
         self.board_id = board_id
 
-    @discord.ui.button(label="Yes, Delete", emoji="✅", style=discord.ButtonStyle.danger, row=0)
+    @discord.ui.button(label="Yes, Delete", emoji=f"{theme.verifiedIcon}", style=discord.ButtonStyle.danger, row=0)
     async def confirm_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
             await interaction.response.defer(ephemeral=True)
@@ -2911,18 +2932,18 @@ class ConfirmDeleteView(discord.ui.View):
             success, error = await self.cog.delete_schedule_board(self.board_id)
 
             if error:
-                await interaction.followup.send(f"❌ Failed to delete: {error}", ephemeral=True)
+                await interaction.followup.send(f"{theme.deniedIcon} Failed to delete: {error}", ephemeral=True)
             else:
-                await interaction.followup.send("✅ Board deleted successfully!", ephemeral=True)
+                await interaction.followup.send(f"{theme.verifiedIcon} Board deleted successfully!", ephemeral=True)
                 # Return to main menu
                 await self.cog.show_main_menu(interaction)
 
         except Exception as e:
             print(f"[ERROR] Error confirming delete: {e}")
             traceback.print_exc()
-            await interaction.followup.send("❌ An error occurred!", ephemeral=True)
+            await interaction.followup.send(f"{theme.deniedIcon} An error occurred!", ephemeral=True)
 
-    @discord.ui.button(label="Cancel", emoji="❌", style=discord.ButtonStyle.secondary, row=0)
+    @discord.ui.button(label="Cancel", emoji=f"{theme.deniedIcon}", style=discord.ButtonStyle.secondary, row=0)
     async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         # Return to board management
         view = BoardManagementView(self.cog, self.guild_id, self.board_id)
